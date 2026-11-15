@@ -1,0 +1,32 @@
+# Build output and local diagnostics
+/dist/
+/design-reference/
+**/.build/
+**/.bsp/
+**/DerivedData/
+**/xtool/
+**/diagnostics/
+**/__pycache__/
+*.pyc
+*.log
+
+# Local credentials and signing material
+.env
+.env.*
+.netrc
+*.ipa
+*.mobileprovision
+*.p12
+*.p8
+*.pem
+*.key
+*.cer
+
+# Editor and OS state
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.codex/
+.agents/
+**/xcuserdata/

@@ -1,0 +1,27 @@
+name: Ошибка
+description: Сбой камеры, эффектов, записи или интерфейса
+body:
+  - type: input
+    id: device
+    attributes:
+      label: Устройство и версии
+      placeholder: iPhone 15 Pro Max / iOS 27.0.1 / trenches 1.2.1
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Режим и эффекты
+      placeholder: Видео 1080p/30, ASCII 6 px, контраст 300%, звук включён
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Как повторить
+      description: Шаги, ожидаемый результат и что произошло. Для рывков уточни, страдает превью или сохранённый ролик.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Дополнительные сведения
+      description: При необходимости приложи технический отчёт camera-performance.txt. Проверь вложения на личные данные.

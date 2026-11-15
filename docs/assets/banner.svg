@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">trenches</title>
+  <desc id="desc">Live camera. ASCII and GPU effects. Dark background with lime typography and an ASCII viewfinder.</desc>
+  <rect width="1280" height="360" rx="16" fill="#0b0d0b"/>
+  <g fill="none" stroke="#30362b" stroke-width="1">
+    <path d="M40 72V40h32M1208 40h32v32M40 288v32h32M1208 320h32v-32"/>
+    <path d="M64 274h1152"/>
+  </g>
+  <g font-family="Consolas,Menlo,monospace">
+    <text x="64" y="79" font-size="15" letter-spacing="2" fill="#a0aa92">[ LIVE CAMERA / GPU FX ]</text>
+    <text x="60" y="195" font-size="94" font-weight="700" letter-spacing="-6" fill="#e8e6d9">trenches<tspan fill="#d6f75e">_</tspan></text>
+    <text x="66" y="238" font-size="17" letter-spacing="1" fill="#a0aa92">КАМЕРА → ЭФФЕКТЫ → ФОТО / ВИДЕО</text>
+    <text x="65" y="307" font-size="14" letter-spacing="1" fill="#d6f75e">[t_]</text>
+    <text x="143" y="307" font-size="14" letter-spacing="1" fill="#a0aa92">iOS 18+  /  SWIFTUI + METAL  /  MIT</text>
+    <g font-size="19" letter-spacing="4" fill="#d6f75e">
+      <text x="835" y="80" opacity=".25">. : - = + * # % @</text>
+      <text x="835" y="108" opacity=".4">: - = + * # % @ %</text>
+      <text x="835" y="136" opacity=".6">- = + * # % @ % #</text>
+      <text x="835" y="164" opacity=".9">= + * # % @ % # *</text>
+      <text x="835" y="192">+ * # % @ % # * +</text>
+      <text x="835" y="220" opacity=".65">* # % @ % # * + =</text>
+      <text x="835" y="248" opacity=".35"># % @ % # * + = -</text>
+    </g>
+  </g>
+</svg>
