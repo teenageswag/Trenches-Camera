@@ -1,7 +1,7 @@
 import Foundation
 
 enum EffectID: String, Codable, CaseIterable, Identifiable {
-    case dof, bloom, tone, color, post, ascii, motion, shakal, macroblock
+    case dof, bloom, tone, color, post, ascii, motion, shakal, macroblock, lensFlare
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -14,6 +14,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .motion: return "Motion blur"
         case .shakal: return "Шакализация"
         case .macroblock: return "Macroblock"
+        case .lensFlare: return "Lens flare"
         }
     }
     var subtitle: String {
@@ -27,6 +28,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .motion: return "Смаз по движению между кадрами"
         case .shakal: return "Пиксели, JPEG-блоки и потеря цвета"
         case .macroblock: return "Смещение блоков по времени и seed"
+        case .lensFlare: return "Отражения света и пыль на линзе"
         }
     }
     var symbol: String {
@@ -40,9 +42,10 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .motion: return "wind"
         case .shakal: return "square.grid.3x3"
         case .macroblock: return "square.grid.4x3.fill"
+        case .lensFlare: return "camera.filters"
         }
     }
-    var mark: String { ["()", "**", "+/-", "RGB", "///", "#", "~>", "jpg", "8×8"][Self.allCases.firstIndex(of: self)!] }
+    var mark: String { ["()", "**", "+/-", "RGB", "///", "#", "~>", "jpg", "8×8", "(*)"][Self.allCases.firstIndex(of: self)!] }
     var parameters: [EffectParameter] {
         switch self {
         case .dof: return [
@@ -101,6 +104,10 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("fraction", "Доля блоков", 0...1, 0.3),
             .slider("rate", "Обновление", 1...30, 12, unit: "Гц"),
             .slider("seed", "Seed", 0...65535, 1, unit: "")]
+        case .lensFlare: return [
+            .slider("amount", "Интенсивность flare", 0...3, 0.6),
+            .slider("dirt", "Интенсивность dirt", 0...4, 1),
+            .slider("threshold", "Порог яркости", 0.1...1, 0.7)]
         }
     }
 }

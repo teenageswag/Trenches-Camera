@@ -14,6 +14,50 @@ uint blockHash(uint2 block, uint tick, uint seed) {
 
 float blockRandom(uint hash) { return float(hash & 0x00ffffffu) / 16777216.0; }
 
+kernel void brightPass(texture2d<float, access::sample> source [[texture(0)]],
+                       texture2d<float, access::write> target [[texture(1)]],
+                       constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
+    float3 c = source.sample(linearSampler, uv).rgb;
+    float l = luminance(c);
+    float weight = smoothstep(p[0].x - 0.08, p[0].x + 0.08, l);
+    target.write(float4(c * weight * max(l - p[0].x, 0.0) / max(l, 0.001), 1), gid);
+}
+
+float3 ghostSample(texture2d<float, access::sample> bright, float2 uv) {
+    float inside = all(uv >= 0.0) && all(uv <= 1.0) ? 1.0 : 0.0;
+    float2 chroma = (uv - 0.5) * 0.008;
+    return float3(bright.sample(linearSampler, uv + chroma).r, bright.sample(linearSampler, uv).g,
+                  bright.sample(linearSampler, uv - chroma).b) * inside;
+}
+
+kernel void lensComposite(texture2d<float, access::sample> source [[texture(0)]],
+                          texture2d<float, access::sample> bright [[texture(1)]],
+                          texture2d<float, access::sample> glow [[texture(2)]],
+                          texture2d<float, access::sample> dirt [[texture(3)]],
+                          texture2d<float, access::write> target [[texture(4)]],
+                          constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
+    float3 c = source.sample(linearSampler, uv).rgb;
+    float3 bloom = glow.sample(linearSampler, uv).rgb;
+    c += bloom * p[0].y;
+    if (p[0].z > 0 || p[0].w > 0) {
+        float3 ghosts = float3(0);
+        for (int i = 0; i < 5; ++i) {
+            float scale = 0.45 + float(i) * 0.4;
+            float2 reflected = 0.5 - (uv - 0.5) * scale;
+            float fade = 1.0 - smoothstep(0.2, 0.75, length(reflected - 0.5));
+            ghosts += ghostSample(bright, reflected) * fade / (1.0 + float(i) * 0.4);
+        }
+        float3 illumination = bloom + glow.sample(linearSampler, 1.0 - uv).rgb * 0.5 + ghosts * 0.35;
+        c += ghosts * p[0].z;
+        c += dirt.sample(linearSampler, uv).rgb * illumination * p[0].w * 16.0;
+    }
+    target.write(float4(c, 1), gid);
+}
+
 float2 corruptedBlockOffset(uint hash, float amount, float block) {
     float2 random = float2(blockRandom(hash * 1664525u + 1013904223u), blockRandom(hash * 22695477u + 1u));
     return round((random * 2.0 - 1.0) * amount / block) * block;

@@ -2,6 +2,7 @@ import AVFoundation
 import CoreImage
 import CoreText
 import Metal
+import MetalKit
 import MetalPerformanceShaders
 
 enum TrenchesError: LocalizedError {
@@ -22,6 +23,9 @@ final class FrameRenderer {
     private let motionEstimate: MTLComputePipelineState
     private let motionBlur: MTLComputePipelineState
     private let macroblock: MTLComputePipelineState
+    private let brightPass: MTLComputePipelineState
+    private let lensComposite: MTLComputePipelineState
+    private let dirt: MTLTexture
     private let atlas: MTLTexture
     private var cache: CVMetalTextureCache!
     private var pool: CVPixelBufferPool?
@@ -37,6 +41,9 @@ final class FrameRenderer {
     private var motionOutput: MTLTexture?
     private var motionTime: Double?
     private var blockOutput: MTLTexture?
+    private var highlights: MTLTexture?
+    private var glow: MTLTexture?
+    private var lightOutput: MTLTexture?
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     init() throws {
@@ -65,6 +72,13 @@ final class FrameRenderer {
         motionBlur = try device.makeComputePipelineState(function: blur)
         guard let blocks = library.makeFunction(name: "macroblockCorrupt") else { throw TrenchesError.message("Не найден Macroblock.") }
         macroblock = try device.makeComputePipelineState(function: blocks)
+        guard let bright = library.makeFunction(name: "brightPass"), let lens = library.makeFunction(name: "lensComposite"),
+              let dirtURL = Bundle.module.url(forResource: "LensDirt", withExtension: "png", subdirectory: "Assets") else {
+            throw TrenchesError.message("Не найдены ресурсы Lens flare.")
+        }
+        brightPass = try device.makeComputePipelineState(function: bright)
+        lensComposite = try device.makeComputePipelineState(function: lens)
+        dirt = try MTKTextureLoader(device: device).newTexture(URL: dirtURL, options: [.SRGB: false, .origin: MTKTextureLoader.Origin.topLeft])
         atlas = try Self.makeAtlas(device)
         guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess else {
             throw TrenchesError.message("Не удалось создать кэш текстур.")
@@ -167,11 +181,8 @@ final class FrameRenderer {
         let textureAttributes = [kCVMetalTextureUsage as String: MTLTextureUsage([.shaderRead, .shaderWrite]).rawValue] as CFDictionary
         guard CVMetalTextureCacheCreateTextureFromImage(nil, cache, output, textureAttributes, .bgra8Unorm, width, height, 0, &outputReference) == kCVReturnSuccess,
               let outputReference, let outputTexture = CVMetalTextureGetTexture(outputReference) else { throw TrenchesError.message("Не удалось создать выходную текстуру.") }
-        var input = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
+        let input = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
         let bounds = CGRect(origin: .zero, size: size)
-        if settings.enabled(.bloom) {
-            input = input.clampedToExtent().applyingFilter("CIBloom", parameters: [kCIInputRadiusKey: settings.value(.bloom, "radius") * Float(width) / 1080, kCIInputIntensityKey: settings.value(.bloom, "amount")]).cropped(to: CGRect(origin: .zero, size: size))
-        }
         var resources: [Any] = [image, outputReference]
         if settings.activeCount == 0 {
             let destination = CIRenderDestination(mtlTexture: outputTexture, commandBuffer: command)
@@ -180,8 +191,7 @@ final class FrameRenderer {
             _ = try context.startTask(toRender: input, from: bounds, to: destination, at: .zero)
             return PendingFrame(output: output, command: command, resources: resources)
         }
-        // Only Bloom before tone mapping needs values above SDR white.
-        let sourceFormat: MTLPixelFormat = settings.enabled(.bloom) && settings.enabled(.tone) ? .rgba16Float : .rgba8Unorm
+        let sourceFormat: MTLPixelFormat = (settings.enabled(.bloom) || settings.enabled(.lensFlare)) && settings.enabled(.tone) ? .rgba16Float : .rgba8Unorm
         var source = try scratch(&self.source, width: width, height: height, format: sourceFormat)
         let destination = CIRenderDestination(mtlTexture: source, commandBuffer: command)
         destination.isFlipped = true
@@ -205,6 +215,23 @@ final class FrameRenderer {
             blit.endEncoding()
             motionTime = time
         } else { motionTime = nil }
+        if settings.enabled(.bloom) || settings.enabled(.lensFlare) {
+            let w = max(1, width / 4), h = max(1, height / 4)
+            let bright = try scratch(&highlights, width: w, height: h, format: .rgba16Float)
+            let soft = try scratch(&glow, width: w, height: h, format: .rgba16Float)
+            var light = [SIMD4<Float>(settings.enabled(.lensFlare) ? settings.value(.lensFlare, "threshold") : 0.65,
+                settings.enabled(.bloom) ? settings.value(.bloom, "amount") : 0,
+                settings.enabled(.lensFlare) ? settings.value(.lensFlare, "amount") : 0,
+                settings.enabled(.lensFlare) ? settings.value(.lensFlare, "dirt") : 0)]
+            try encode(command, pipeline: brightPass, textures: [source, bright], parameters: &light, width: w, height: h)
+            let sigma = settings.enabled(.bloom) ? settings.value(.bloom, "radius") * Float(width) / 4320 : 6
+            let blur = MPSImageGaussianBlur(device: device, sigma: max(0.5, sigma))
+            blur.edgeMode = .clamp
+            blur.encode(commandBuffer: command, sourceTexture: bright, destinationTexture: soft)
+            let output = try scratch(&lightOutput, width: width, height: height, format: sourceFormat)
+            try encode(command, pipeline: lensComposite, textures: [source, bright, soft, dirt, output], parameters: &light, width: width, height: height)
+            source = output
+        }
         var blurTexture = source
         if settings.enabled(.dof) {
             blurTexture = try scratch(&blurred, width: width, height: height, format: sourceFormat)

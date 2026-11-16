@@ -16,7 +16,7 @@ let package = Package(
     targets: [
         .target(
             name: "Trenches",
-            resources: [.copy("Shaders")],
+            resources: [.copy("Shaders"), .copy("Assets")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
