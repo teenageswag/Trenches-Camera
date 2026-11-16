@@ -17,6 +17,10 @@ struct CameraStatus {
     var fps = 0
     var droppedFrames = 0
     var audio = false
+    var zoom = 1.0
+    var minZoom = 1.0
+    var maxZoom = 10.0
+    var zoomStops: [Double] = [1, 2]
 }
 
 final class CameraService: NSObject, @unchecked Sendable {
@@ -27,6 +31,7 @@ final class CameraService: NSObject, @unchecked Sendable {
     var onSaved: ((URL, String) -> Void)?
     private var session: AVCaptureSession?
     private var device: AVCaptureDevice?
+    private var zoomObservation: NSKeyValueObservation?
     private var videoOutput: AVCaptureVideoDataOutput?
     private var photoOutput: AVCapturePhotoOutput?
     private var audioOutput: AVCaptureAudioDataOutput?
@@ -118,7 +123,11 @@ final class CameraService: NSObject, @unchecked Sendable {
     }
 
     private func configure(lens: CameraLens, quality: CaptureQuality, wantsDepth: Bool) throws {
-        guard let camera = Self.captureDevice(lens, depth: wantsDepth) else { throw TrenchesError.message("Эта камера недоступна.") }
+        let virtual = lens != .front && !wantsDepth ?
+            (AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back) ??
+             AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) ??
+             AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back)) : nil
+        guard let camera = virtual ?? Self.captureDevice(lens, depth: wantsDepth) else { throw TrenchesError.message("Эта камера недоступна.") }
         let formats = camera.formats.filter {
             let dimensions = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
             return dimensions.width == quality.width && dimensions.height == quality.height && $0.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= Double(quality.fps) && $0.minFrameRate <= Double(quality.fps) }
@@ -144,6 +153,9 @@ final class CameraService: NSObject, @unchecked Sendable {
             let actualFPS = min(quality.fps, Int32(depthMaxFPS))
             camera.activeVideoMinFrameDuration = CMTime(value: 1, timescale: actualFPS)
             camera.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: actualFPS)
+            let multiplier = Double(camera.displayVideoZoomFactorMultiplier)
+            let initialZoom = lens == status.lens && device != nil ? status.zoom : 1
+            camera.videoZoomFactor = min(camera.maxAvailableVideoZoomFactor, max(camera.minAvailableVideoZoomFactor, CGFloat(initialZoom / multiplier)))
             camera.unlockForConfiguration()
 
             let video = AVCaptureVideoDataOutput()
@@ -187,6 +199,18 @@ final class CameraService: NSObject, @unchecked Sendable {
             observers.forEach(NotificationCenter.default.removeObserver)
             observers.removeAll()
             session = newSession; device = camera
+            status.minZoom = Double(camera.minAvailableVideoZoomFactor) * multiplier
+            status.maxZoom = min(25, Double(camera.maxAvailableVideoZoomFactor) * multiplier)
+            status.zoom = Double(camera.videoZoomFactor) * multiplier
+            status.zoomStops = Array(Set(([status.minZoom, 1, 2] + camera.virtualDeviceSwitchOverVideoZoomFactors.map { $0.doubleValue * multiplier })
+                .filter { $0 >= status.minZoom && $0 <= status.maxZoom })).sorted()
+            zoomObservation = camera.observe(\.videoZoomFactor, options: [.new]) { [weak self] camera, _ in
+                let zoom = Double(camera.videoZoomFactor * camera.displayVideoZoomFactorMultiplier)
+                self?.queue.async { [weak self] in
+                    guard let self, self.device === camera else { return }
+                    self.status.zoom = zoom; self.publish()
+                }
+            }
             sessionGeneration &+= 1
             renderer?.resetMotion()
             preview.clear()
@@ -240,6 +264,22 @@ final class CameraService: NSObject, @unchecked Sendable {
     }
 
     private func startIfDesired() { queue.async { [weak self] in guard let self, self.desiredRunning else { return }; self.session?.startRunning(); self.status.running = self.session?.isRunning == true; self.publish() } }
+
+    func setZoom(_ zoom: Double, smoothly: Bool = false) {
+        guard zoom.isFinite else { return }
+        queue.async { [self] in
+            guard let device, !status.finishing, !status.photoBusy else { return }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                let displayZoom = min(status.maxZoom, max(status.minZoom, zoom))
+                let factor = CGFloat(displayZoom) / device.displayVideoZoomFactorMultiplier
+                device.cancelVideoZoomRamp()
+                if smoothly { device.ramp(toVideoZoomFactor: factor, withRate: 4) }
+                else { device.videoZoomFactor = factor }
+            } catch { fail(error) }
+        }
+    }
 
     func focus(x: Float, y: Float) {
         queue.async { [self] in

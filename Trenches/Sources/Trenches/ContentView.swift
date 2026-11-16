@@ -20,6 +20,8 @@ struct ContentView: View {
     @State private var focusPoint: CGPoint?
     @State private var focusTask: Task<Void, Never>?
     @State private var grid = false
+    @State private var pinchStart: Double?
+    @State private var showZoom = false
 
     var body: some View {
         VStack(spacing: 4) {
@@ -78,6 +80,10 @@ struct ContentView: View {
             ZStack {
                 CameraPreview(frames: model.service.preview)
                     .contentShape(Rectangle())
+                    .simultaneousGesture(MagnifyGesture().onChanged { value in
+                        if pinchStart == nil { pinchStart = model.status.zoom }
+                        model.service.setZoom((pinchStart ?? 1) * value.magnification)
+                    }.onEnded { _ in pinchStart = nil })
                     .onTapGesture { point in
                         guard model.status.running, width > 0, height > 0 else { return }
                         let normalized = CGPoint(x: min(1, max(0, point.x / width)), y: min(1, max(0, point.y / height)))
@@ -112,6 +118,12 @@ struct ContentView: View {
                     }.font(.system(size: 10, weight: .semibold, design: .monospaced))
                     Spacer()
                     if let warning = model.depthWarning { Text(warning).font(.caption).padding(10).background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 12)) }
+                    if showZoom, model.status.maxZoom > model.status.minZoom {
+                        Slider(value: Binding(get: { log(model.status.zoom) }, set: { model.service.setZoom(exp($0)) }),
+                               in: log(model.status.minZoom)...log(model.status.maxZoom)) { Text("Зум") }
+                            .tint(TrenchesTheme.accent)
+                            .accessibilityValue(zoomTitle(model.status.zoom))
+                    }
                     HStack {
                         lensControls
                         Spacer(minLength: 0)
@@ -143,18 +155,25 @@ struct ContentView: View {
 
     private var lensControls: some View {
         HStack(spacing: 2) {
-            ForEach(model.status.availableLenses.filter { $0 != .front }) { lens in
-                Button { model.service.select(lens: lens) } label: {
-                    Text(model.status.lens == lens ? "[\(lens.title)]" : lens.title)
+            ForEach(model.status.zoomStops, id: \.self) { zoom in
+                let selected = abs(model.status.zoom - zoom) < 0.05
+                Button { model.service.setZoom(zoom, smoothly: !reduceMotion) } label: {
+                    Text(selected ? "[\(zoomTitle(zoom))]" : zoomTitle(zoom))
                         .font(.system(size: 11, weight: .semibold, design: .monospaced)).frame(minWidth: 44, minHeight: 44)
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(model.status.lens == lens ? TrenchesTheme.accent : .white.opacity(0.75))
-                .accessibilityLabel("Объектив \(lens.title)")
-                .accessibilityAddTraits(model.status.lens == lens ? .isSelected : [])
+                .foregroundStyle(selected ? TrenchesTheme.accent : .white.opacity(0.75))
+                .onLongPressGesture { showZoom = true }
+                .accessibilityLabel("Зум \(zoomTitle(zoom))")
+                .accessibilityAddTraits(selected ? .isSelected : [])
             }
-        }.disabled(model.controlsLocked)
+            Button { showZoom.toggle() } label: {
+                Image(systemName: showZoom ? "chevron.down" : "dial.low").frame(minWidth: 44, minHeight: 44)
+            }.buttonStyle(.plain).accessibilityLabel("Плавный зум, \(zoomTitle(model.status.zoom))")
+        }.disabled(model.status.finishing || model.status.photoBusy)
     }
+
+    private func zoomTitle(_ zoom: Double) -> String { String(format: zoom.rounded() == zoom ? "%.0f×" : "%.1f×", zoom) }
 
     @ViewBuilder private var cameraUnavailable: some View {
         VStack(spacing: 14) {
