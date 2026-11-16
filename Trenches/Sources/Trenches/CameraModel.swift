@@ -13,7 +13,7 @@ final class CameraModel: ObservableObject {
     @Published var settings: EffectSettings {
         didSet {
             service.update(settings)
-            if let data = try? JSONEncoder().encode(settings) { UserDefaults.standard.set(data, forKey: "trenches.settings.v1") }
+            if let data = try? JSONEncoder().encode(settings.disabledEffects) { UserDefaults.standard.set(data, forKey: "trenches.settings.v1") }
         }
     }
     @Published var presets: [LookPreset] {
@@ -24,7 +24,7 @@ final class CameraModel: ObservableObject {
     private var started = false
 
     init() {
-        settings = UserDefaults.standard.data(forKey: "trenches.settings.v1").flatMap { try? JSONDecoder().decode(EffectSettings.self, from: $0) } ?? EffectSettings()
+        settings = (UserDefaults.standard.data(forKey: "trenches.settings.v1").flatMap { try? JSONDecoder().decode(EffectSettings.self, from: $0) } ?? EffectSettings()).disabledEffects
         presets = UserDefaults.standard.data(forKey: "trenches.presets.v1").flatMap { try? JSONDecoder().decode([LookPreset].self, from: $0) } ?? []
         service.onStatus = { [weak self] status in
             Task { @MainActor in

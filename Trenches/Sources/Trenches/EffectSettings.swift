@@ -145,6 +145,11 @@ struct EffectSettings: Codable, Equatable {
     }
     var wantsDepth: Bool { enabled(.dof) && value(.dof, "mode") >= 0.5 }
     var activeCount: Int { EffectID.allCases.filter { enabled($0) }.count }
+    var disabledEffects: Self {
+        var copy = self
+        for id in copy.effects.keys { copy.effects[id]?.enabled = false }
+        return copy
+    }
 }
 
 struct LookPreset: Codable, Identifiable {

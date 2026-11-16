@@ -21,6 +21,9 @@ struct SettingsChecks {
         precondition(settings.wantsDepth)
         let restored = try JSONDecoder().decode(EffectSettings.self, from: JSONEncoder().encode(settings))
         precondition(settings == restored)
+        precondition(restored.disabledEffects.activeCount == 0)
+        precondition(restored.disabledEffects.value(.dof, "mode") == 1)
+        precondition(restored.activeCount == EffectID.allCases.count)
         precondition(LookPreset.builtIns.count == 3)
         for preset in LookPreset.builtIns { precondition(preset.settings.activeCount > 0) }
         precondition(CaptureQuality.uhd30.width == 3840 && CaptureQuality.hd60.fps == 60)
