@@ -78,6 +78,7 @@ struct EffectEditor: View {
     }
 
     private func visible(_ parameter: EffectParameter) -> Bool {
+        if effect == .shakal, ["audioBits", "audioRate", "audioMix"].contains(parameter.id) { return model.settings.value(.shakal, "audio") > 0.5 }
         guard effect == .dof else { return true }
         let depthMode = model.settings.value(.dof, "mode") >= 0.5
         return parameter.id == "radius" ? !depthMode : (["focus", "range"].contains(parameter.id) ? depthMode : true)

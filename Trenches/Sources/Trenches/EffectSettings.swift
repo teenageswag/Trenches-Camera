@@ -83,7 +83,11 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("scale", "Понижение разрешения", 1...12, 3, unit: "×"),
             .slider("chroma", "Потеря цвета", 0...1, 0.7),
             .choice("sampling", "Масштабирование", ["Пиксели", "Мыло"]),
-            .slider("mix", "Смешивание", 0...1, 1)]
+            .slider("mix", "Смешивание", 0...1, 1),
+            .choice("audio", "Шакалить звук", ["Выключено", "Включено"]),
+            .slider("audioBits", "Разрядность звука", 3...16, 8, unit: "бит"),
+            .slider("audioRate", "Частота звука", 2...48, 8, unit: "кГц"),
+            .slider("audioMix", "Смешивание звука", 0...1, 1)]
         }
     }
 }

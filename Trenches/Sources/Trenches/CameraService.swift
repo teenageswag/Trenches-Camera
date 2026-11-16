@@ -34,6 +34,7 @@ final class CameraService: NSObject, @unchecked Sendable {
     private var synchronizer: AVCaptureDataOutputSynchronizer?
     private var renderer: FrameRenderer?
     private var recorder: MovieRecorder?
+    private let audioDegrader = AudioDegrader()
     private var settings = EffectSettings()
     private var status = CameraStatus()
     private var observers: [NSObjectProtocol] = []
@@ -275,6 +276,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             guard status.running, !status.finishing, !status.photoBusy, let buffer = preview.latest() else { return }
             do {
                 recorder = try MovieRecorder(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer), fps: status.captureFPS, includeAudio: status.audio)
+                audioDegrader.reset()
                 performanceRows = ["Camera recording \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)), target \(status.captureFPS) FPS", "ASCII \(settings.enabled(.ascii)), cell \(settings.value(.ascii, "cell")), contrast \(settings.value(.ascii, "contrast"))", "audio \(status.audio)"]
                 status.recording = true; publish()
             } catch { fail(error) }
@@ -382,7 +384,7 @@ final class CameraService: NSObject, @unchecked Sendable {
 extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureDataOutputSynchronizerDelegate, AVCapturePhotoCaptureDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         if output === audioOutput {
-            do { try recorder?.appendAudio(sampleBuffer) }
+            do { if let recorder { try recorder.appendAudio(audioDegrader.process(sampleBuffer, settings: settings)) } }
             catch { stopRecordingOwned(); fail(error) }
         } else { process(sampleBuffer, depth: nil) }
     }
