@@ -70,11 +70,15 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("halftone", "Халфтон", 0...1, 0),
             .slider("pixel", "Пикселизация", 1...48, 1, unit: "px")]
         case .ascii: return [
-            .slider("cell", "Размер символов", 6...32, 12, unit: "px"),
-            .slider("contrast", "Контраст символов", 0.5...3, 1.2),
-            .choice("palette", "Палитра", ["Бумага", "Терминал", "Янтарь", "Цвет"]),
+            .slider("cell", "Размер символов", 2...96, 12, unit: "px"),
+            .slider("contrast", "Контраст символов", 0.1...10, 1.2),
+            .choice("symbols", "Символы", ASCIISymbols.allCases.map(\.title)),
+            .choice("palette", "Палитра", ["Бумага", "Терминал", "Янтарь", "Цвет кадра", "Свой цвет", "Градиент"]),
             .choice("invert", "Яркость", ["Обычная", "Инверсия"]),
-            .slider("mix", "Смешивание", 0...1, 1)]
+            .slider("mix", "Смешивание", 0...1, 1),
+            .slider("inkR", "", 0...1, 0.84), .slider("inkG", "", 0...1, 0.97), .slider("inkB", "", 0...1, 0.37),
+            .slider("ink2R", "", 0...1, 1), .slider("ink2G", "", 0...1, 0.3), .slider("ink2B", "", 0...1, 0.6),
+            .slider("paperR", "", 0...1, 0), .slider("paperG", "", 0...1, 0), .slider("paperB", "", 0...1, 0)]
         case .motion: return [
             .slider("radius", "Длина смаза", 0...80, 16, unit: "px"),
             .slider("mix", "Смешивание", 0...1, 1)]
@@ -88,6 +92,19 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("audioBits", "Разрядность звука", 3...16, 8, unit: "бит"),
             .slider("audioRate", "Частота звука", 2...48, 8, unit: "кГц"),
             .slider("audioMix", "Смешивание звука", 0...1, 1)]
+        }
+    }
+}
+
+enum ASCIISymbols: Int, CaseIterable {
+    case classic, detailed, blocks, binary
+    var title: String { ["Классика", "Детальные", "Блоки", "Двоичные"][rawValue] }
+    var characters: String {
+        switch self {
+        case .classic: return " .:-=+*#%@"
+        case .detailed: return " .`',:;^-~_+<>!iIl1?][}{)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
+        case .blocks: return " ░▒▓█"
+        case .binary: return " 01"
         }
     }
 }

@@ -58,6 +58,17 @@ struct EffectEditor: View {
                         parameterControl(parameter)
                     }
                 }
+                if effect == .ascii {
+                    Section("Цвета ASCII") {
+                        if model.settings.value(.ascii, "palette") >= 4 {
+                            ColorPicker("Цвет символов", selection: asciiColor("ink"), supportsOpacity: false)
+                        }
+                        if model.settings.value(.ascii, "palette") >= 5 {
+                            ColorPicker("Второй цвет символов", selection: asciiColor("ink2"), supportsOpacity: false)
+                        }
+                        ColorPicker("Цвет фона", selection: asciiColor("paper"), supportsOpacity: false)
+                    }
+                }
                 if effect == .dof {
                     Section {
                         Label(model.settings.wantsDepth ? (model.status.depthReceiving ? "Карта глубины активна" : "Карта глубины не получена") : "Точка резкости — касанием по превью", systemImage: "viewfinder")
@@ -78,10 +89,22 @@ struct EffectEditor: View {
     }
 
     private func visible(_ parameter: EffectParameter) -> Bool {
+        if effect == .ascii, parameter.title.isEmpty { return false }
         if effect == .shakal, ["audioBits", "audioRate", "audioMix"].contains(parameter.id) { return model.settings.value(.shakal, "audio") > 0.5 }
         guard effect == .dof else { return true }
         let depthMode = model.settings.value(.dof, "mode") >= 0.5
         return parameter.id == "radius" ? !depthMode : (["focus", "range"].contains(parameter.id) ? depthMode : true)
+    }
+    private func asciiColor(_ prefix: String) -> Binding<Color> {
+        Binding(get: {
+            Color(red: Double(model.settings.value(.ascii, prefix + "R")), green: Double(model.settings.value(.ascii, prefix + "G")), blue: Double(model.settings.value(.ascii, prefix + "B")))
+        }, set: { color in
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            guard UIColor(color).getRed(&r, green: &g, blue: &b, alpha: &a) else { return }
+            var settings = model.settings
+            settings.set(.ascii, prefix + "R", Float(r)); settings.set(.ascii, prefix + "G", Float(g)); settings.set(.ascii, prefix + "B", Float(b))
+            model.settings = settings
+        })
     }
     private func binding(_ parameter: EffectParameter) -> Binding<Float> {
         Binding(get: { model.settings.value(effect, parameter.id) }, set: { model.settings.set(effect, parameter.id, $0) })

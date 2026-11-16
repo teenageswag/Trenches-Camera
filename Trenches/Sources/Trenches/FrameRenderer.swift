@@ -68,17 +68,20 @@ final class FrameRenderer {
     }
 
     private static func makeAtlas(_ device: MTLDevice) throws -> MTLTexture {
-        let width = 320, height = 48
+        let columns = ASCIISymbols.allCases.map { $0.characters.count }.max()!
+        let width = columns * 32, height = 48 * ASCIISymbols.allCases.count
         var bytes = [UInt8](repeating: 0, count: width * height)
         let ok = bytes.withUnsafeMutableBytes { raw -> Bool in
             guard let cg = CGContext(data: raw.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
             cg.setFillColor(gray: 1, alpha: 1)
             cg.textMatrix = .identity
             let font = CTFontCreateWithName("Menlo" as CFString, 34, nil)
-            for (index, character) in Array(" .:-=+*#%@").enumerated() {
+            for mode in ASCIISymbols.allCases {
+              for (index, character) in Array(mode.characters).enumerated() {
                 let string = NSAttributedString(string: String(character), attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font, NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true])
-                cg.textPosition = CGPoint(x: index * 32 + 6, y: 12)
+                cg.textPosition = CGPoint(x: index * 32 + 5, y: height - (mode.rawValue + 1) * 48 + 12)
                 CTLineDraw(CTLineCreateWithAttributedString(string), cg)
+              }
             }
             return true
         }
@@ -217,7 +220,7 @@ final class FrameRenderer {
                 depthTexture = CVMetalTextureGetTexture(depthReference)
             }
         }
-        var p = [SIMD4<Float>](repeating: .zero, count: 13)
+        var p = [SIMD4<Float>](repeating: .zero, count: 16)
         func on(_ id: EffectID) -> Float { settings.enabled(id) ? 1 : 0 }
         p[0] = SIMD4(on(.dof), settings.value(.dof, "mode"), depthTexture == nil ? 0 : 1, 0)
         p[1] = SIMD4(settings.value(.dof, "focus"), settings.value(.dof, "range"), settings.value(.dof, "radius"), 0)
@@ -237,6 +240,11 @@ final class FrameRenderer {
         p[8] = SIMD4(settings.value(.post, "scan"), settings.value(.post, "halftone"), Float(time.truncatingRemainder(dividingBy: 3600)), settings.value(.post, "pixel"))
         p[9] = SIMD4(on(.ascii), settings.value(.ascii, "cell"), settings.value(.ascii, "contrast"), settings.value(.ascii, "palette"))
         p[10] = SIMD4(settings.value(.ascii, "invert"), settings.value(.ascii, "mix"), 0, 0)
+        let symbols = ASCIISymbols(rawValue: Int(settings.value(.ascii, "symbols"))) ?? .classic
+        p[10].z = Float(symbols.rawValue); p[10].w = Float(symbols.characters.count)
+        p[13] = SIMD4(settings.value(.ascii, "inkR"), settings.value(.ascii, "inkG"), settings.value(.ascii, "inkB"), 0)
+        p[14] = SIMD4(settings.value(.ascii, "ink2R"), settings.value(.ascii, "ink2G"), settings.value(.ascii, "ink2B"), 0)
+        p[15] = SIMD4(settings.value(.ascii, "paperR"), settings.value(.ascii, "paperG"), settings.value(.ascii, "paperB"), 0)
         p[11] = SIMD4(on(.shakal), settings.value(.shakal, "quality"), settings.value(.shakal, "scale"), settings.value(.shakal, "chroma"))
         p[12] = SIMD4(settings.value(.shakal, "sampling"), settings.value(.shakal, "mix"), Float(width), Float(height))
         var graded = source

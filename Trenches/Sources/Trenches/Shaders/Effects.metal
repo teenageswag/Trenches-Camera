@@ -143,7 +143,7 @@ kernel void asciiPrepare(texture2d<float, access::sample> source [[texture(0)]],
     float3 original = postSample(source, compressed, center, p, size);
     float l = clamp((luminance(original) - 0.5) * p[9].z + 0.5, 0.0, 1.0);
     if (p[10].x > 0.5) l = 1.0 - l;
-    float glyph = min(floor(l * 10.0), 9.0);
+    float glyph = min(floor(l * p[10].w), p[10].w - 1.0);
     cells.write(float4(original, glyph / 255.0), gid);
 }
 
@@ -182,12 +182,15 @@ kernel void finish(texture2d<float, access::sample> source [[texture(0)]],
         float3 original = cellValue.rgb;
         float glyph = round(cellValue.a * 255.0);
         float2 local = fract(position);
-        float mask = atlas.sample(glyphSampler, float2((glyph + local.x) / 10.0, local.y)).r;
+        float mask = atlas.sample(glyphSampler, float2((glyph + local.x) / float(atlas.get_width() / 32), (p[10].z + local.y) / 4.0)).r;
         float3 ink = float3(0.91, 0.90, 0.84);
-        if (p[9].w > 2.5) ink = original;
+        if (p[9].w > 4.5) ink = mix(p[13].rgb, p[14].rgb, glyph / max(1.0, p[10].w - 1.0));
+        else if (p[9].w > 3.5) ink = p[13].rgb;
+        else if (p[9].w > 2.5) ink = original;
         else if (p[9].w > 1.5) ink = float3(1.0, 0.62, 0.19);
         else if (p[9].w > 0.5) ink = float3(0.53, 1.0, 0.43);
-        c = fullASCII ? ink * mask : mix(c, ink * mask, p[10].y);
+        float3 ascii = mix(p[15].rgb, ink, mask);
+        c = fullASCII ? ascii : mix(c, ascii, p[10].y);
     }
     target.write(float4(clamp(c, 0.0, 1.0), 1), gid);
 }
