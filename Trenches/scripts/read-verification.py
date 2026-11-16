@@ -8,6 +8,7 @@ import zipfile
 parser = argparse.ArgumentParser(description="Read only the app's technical text report over USB")
 parser.add_argument("output", nargs="?", type=pathlib.Path)
 parser.add_argument("--camera", action="store_true", help="Read counters from the last camera recording")
+parser.add_argument("--datamosh", action="store_true", help="Read technical Datamosh preview timestamps, without video content")
 parser.add_argument("--bundle-id", help="Override the Bundle ID from the local signed IPA")
 args = parser.parse_args()
 bundle_id = args.bundle_id
@@ -39,7 +40,7 @@ device = pointer()
 house = pointer()
 afc = pointer()
 handle = c.c_uint64()
-report_name = "camera-performance.txt" if args.camera else "verification.txt"
+report_name = "datamosh-preview.txt" if args.datamosh else ("camera-performance.txt" if args.camera else "verification.txt")
 try:
     check(bind("idevice_new", [c.POINTER(pointer), c.c_char_p])(c.byref(device), None), "Connect device")
     check(bind("house_arrest_client_start_service", [pointer, c.POINTER(pointer), c.c_char_p])(device, c.byref(house), b"trenches-diagnostics"), "Open app service")

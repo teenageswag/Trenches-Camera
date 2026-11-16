@@ -139,10 +139,18 @@ enum PipelineVerification {
         guard CMSampleBufferGetNumSamples(degraded) == 1600, CMSampleBufferGetPresentationTimeStamp(degraded) == CMTime(value: 1, timescale: 30) else { throw TrenchesError.message("Шакализация нарушила время звука") }
         record("PASS PCM audio degradation / sample count and timing")
         let recorder = try MovieRecorder(width: 96, height: 160, fps: 30, includeAudio: true)
+        let captureStart = CMTime(value: 123_456_789_012_345, timescale: 1_000_000_000)
         for frame in inputs.indices {
-            let time = CMTime(value: Int64(frame) * 33_333_333 + Int64(frame % 3) * 17, timescale: 1_000_000_000)
+            let time = CMTimeAdd(captureStart, CMTime(value: Int64(frame) * 33_333_333 + Int64(frame % 3) * 17, timescale: 1_000_000_000))
             try recorder.appendVideo(inputs[frame], at: time)
-            try recorder.appendAudio(RenderBenchmark.audio(at: frame))
+            let audio = try RenderBenchmark.audio(at: frame)
+            var timing = CMSampleTimingInfo()
+            guard CMSampleBufferGetSampleTimingInfo(audio, at: 0, timingInfoOut: &timing) == noErr else { throw TrenchesError.message("Не удалось сдвинуть тестовый звук") }
+            timing.presentationTimeStamp = CMTimeAdd(timing.presentationTimeStamp, captureStart)
+            var shifted: CMSampleBuffer?
+            guard CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: audio, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &shifted) == noErr,
+                  let shifted else { throw TrenchesError.message("Не удалось сдвинуть тестовый звук") }
+            try recorder.appendAudio(shifted)
         }
         let source: URL = try await withCheckedThrowingContinuation { continuation in recorder.finish { continuation.resume(with: $0) } }
         defer { try? FileManager.default.removeItem(at: source) }
@@ -167,7 +175,7 @@ enum PipelineVerification {
         for frame in [0, 13, 1, 12, 2, 11, 3, 10, 4, 9, 5, 8, 6, 7] {
             _ = try worker.preview(media, document: mixed, frame: frame, cancellation: token)
         }
-        record("PASS shuffled frame-exact scrubbing / fractional capture timestamps")
+        record("PASS shuffled frame-exact scrubbing / nonzero fractional capture clock / empty edit-list samples")
         record("PASS mixed-mode MOV export / bit-exact compressed audio / exact frame count / deterministic scrubbing")
     }
 

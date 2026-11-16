@@ -44,10 +44,15 @@ final class DatamoshMedia: @unchecked Sendable {
         while let sample = output.copyNextSampleBuffer() {
             try cancellation.check()
             let time = CMSampleBufferGetPresentationTimeStamp(sample)
-            if time.isNumeric { times.append(time) }
+            // Passthrough readers also return empty edit-list samples. They describe
+            // timeline gaps, not displayable frames (often a second PTS=0 entry).
+            if time.isNumeric, CMSampleBufferGetNumSamples(sample) > 0 { times.append(time) }
         }
         guard reader.status != .failed else { throw reader.error ?? TrenchesError.message("Временная шкала повреждена.") }
         times.sort { CMTimeCompare($0, $1) < 0 }
+        var displayTimes: [CMTime] = []
+        for time in times where displayTimes.last.map({ CMTimeCompare($0, time) != 0 }) ?? true { displayTimes.append(time) }
+        times = displayTimes
         guard times.count >= 2 else { throw TrenchesError.message("Для Datamosh нужны минимум два кадра.") }
         return DatamoshMedia(url: url, asset: asset, video: video, audio: audio, audioFormat: format, times: times, duration: duration,
             size: CGSize(width: abs(size.width), height: abs(size.height)), transform: transform)
@@ -135,11 +140,17 @@ final class DatamoshWorker: @unchecked Sendable {
             previewDocument = document; previewURL = media.url
         }
         guard let renderer = previewRenderer, let output = previewOutput else { throw TrenchesError.message("Превью недоступно.") }
+        var trace = ["requested=\(frame), count=\(media.frameCount), replayStart=\(previewStart), last=\(lastFrame)",
+            "targetTime=\(media.times[frame].seconds), first=\(media.times[0].seconds), end=\(media.times.last!.seconds), duration=\(media.duration.seconds)",
+            "firstTimes=\(media.times.prefix(8).map { $0.seconds })"]
         while let sample = output.copyNextSampleBuffer() {
             try cancellation.check()
             let index = media.decodedFrame(at: CMSampleBufferGetPresentationTimeStamp(sample))
+            trace.append("decoded=\(index), pts=\(CMSampleBufferGetPresentationTimeStamp(sample).seconds), samples=\(CMSampleBufferGetNumSamples(sample)), image=\(CMSampleBufferGetImageBuffer(sample) != nil)")
+            if trace.count > 24 { trace.remove(at: 3) }
             if index < previewStart { continue }
-            guard index <= frame, let input = CMSampleBufferGetImageBuffer(sample) else { break }
+            guard let input = CMSampleBufferGetImageBuffer(sample) else { continue }
+            guard index <= frame else { break }
             let result = try autoreleasepool { try renderer.render(input, frame: index, document: document) }
             let id = document.segment(at: index)?.id
             if previewSegmentID != id { previewMovement = 0; previewSegmentID = id }
@@ -153,6 +164,10 @@ final class DatamoshWorker: @unchecked Sendable {
             }
         }
         try cancellation.check()
+        trace.append("readerStatus=\(previewReader?.status.rawValue ?? -1), error=\(previewReader?.error?.localizedDescription ?? "none")")
+        if let directory = try? CaptureLibrary.directory().deletingLastPathComponent() {
+            try? trace.joined(separator: "\n").write(to: directory.appendingPathComponent("datamosh-preview.txt"), atomically: true, encoding: .utf8)
+        }
         if let error = previewReader?.error { throw error }
         throw TrenchesError.message("Не удалось прочитать выбранный кадр.")
     }
@@ -238,7 +253,7 @@ final class DatamoshWorker: @unchecked Sendable {
                 try autoreleasepool {
                     let time = CMSampleBufferGetPresentationTimeStamp(sample)
                     let frame = media.decodedFrame(at: time)
-                    guard let buffer = CMSampleBufferGetImageBuffer(sample) else { throw TrenchesError.message("Декодер вернул пустой кадр.") }
+                    guard let buffer = CMSampleBufferGetImageBuffer(sample) else { return }
                     let result = try renderer.render(buffer, frame: frame, document: document)
                     guard adaptor.append(result, withPresentationTime: time) else { throw writer.error ?? TrenchesError.message("Не удалось записать кадр Datamosh.") }
                     let percent = (frame + 1) * 100 / media.frameCount
