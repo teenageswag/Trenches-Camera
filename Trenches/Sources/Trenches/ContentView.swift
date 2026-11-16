@@ -61,7 +61,6 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("[t_]").foregroundStyle(TrenchesTheme.accent).accessibilityHidden(true)
             Text("trenches").font(.system(size: 19, weight: .bold, design: .monospaced)).tracking(-0.8)
             Spacer()
             Button { panel = .presets } label: { Text("[ПРЕСЕТЫ]").frame(minHeight: 44) }
