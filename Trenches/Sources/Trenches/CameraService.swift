@@ -29,6 +29,7 @@ final class CameraService: NSObject, @unchecked Sendable {
     var onStatus: ((CameraStatus) -> Void)?
     var onError: ((String) -> Void)?
     var onSaved: ((URL, String) -> Void)?
+    var onVideoRecorded: ((URL) -> Void)?
     private var session: AVCaptureSession?
     private var device: AVCaptureDevice?
     private var zoomObservation: NSKeyValueObservation?
@@ -97,6 +98,8 @@ final class CameraService: NSObject, @unchecked Sendable {
             if recorder != nil { stopRecordingOwned() }
             session?.stopRunning()
             renderer?.resetMotion()
+            renderer = nil
+            preview.clear()
             status.running = false
             publish()
         }
@@ -106,6 +109,7 @@ final class CameraService: NSObject, @unchecked Sendable {
         queue.async { [self] in
             let changedDepth = settings.wantsDepth != newSettings.wantsDepth
             if changedDepth && (status.recording || status.finishing || status.photoBusy) { return }
+            if settings.enabled(.motion) != newSettings.enabled(.motion) { renderer?.resetMotion() }
             settings = newSettings
             if changedDepth, session != nil {
                 do { try configure(lens: status.lens, quality: status.quality, wantsDepth: settings.wantsDepth) }
@@ -345,7 +349,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             self.queue.async {
                 self.status.finishing = false; self.publish()
                 switch result {
-                case .success(let url): self.saved(url)
+                case .success(let url): self.onVideoRecorded?(url); self.saved(url)
                 case .failure(let error): self.fail(error)
                 }
                 DispatchQueue.main.async { self.endBackgroundTask() }

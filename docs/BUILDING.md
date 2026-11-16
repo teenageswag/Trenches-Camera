@@ -51,7 +51,7 @@ usbipd attach --wsl --busid <BUSID_телефона>
 bash Trenches/scripts/test-settings.sh
 ```
 
-Проверяются настройки, границы параметров, восстановление JSON, пресеты и профили записи. GitHub Actions запускает эту проверку и проверяет синтаксис скриптов; полный iOS-билд в CI не настроен.
+Проверяются настройки, границы параметров, восстановление JSON, пресеты, профили записи и модель Datamosh (пересечения, границы, сбросы, undo/redo, пресеты, отмена). GitHub Actions запускает эту проверку и проверяет синтаксис скриптов; полный iOS-билд в CI не настроен.
 
 Диагностика на своём iPhone:
 
@@ -60,7 +60,7 @@ TRENCHES_VERIFY=1 bash Trenches/scripts/build.sh --sign -c debug
 bash Trenches/scripts/install.sh
 ```
 
-Открой trenches вручную. Режим проверит Metal, восемь эффектов, JPEG/MOV и запись движущегося ASCII 1080p/30 со синтетическим звуком. После COMPLETE или FAIL:
+Открой trenches вручную. Режим проверит Metal, десять live-эффектов, статичный и движущийся Motion Blur, семь режимов Datamosh, сбросы и скраббинг, смешанный экспорт с точным копированием AAC, JPEG/MOV и запись движущегося ASCII 1080p/30 со синтетическим звуком. После COMPLETE или FAIL:
 
 ```bash
 python3 Trenches/scripts/read-verification.py
@@ -84,6 +84,11 @@ python3 Trenches/scripts/read-verification.py --camera
 | `MovieRecorder.swift` | HEVC / H.264 + AAC, временная шкала и завершение MOV |
 | `CameraModel.swift`, `ContentView.swift`, `EffectPanels.swift` | Состояние и SwiftUI-интерфейс |
 | `EffectSettings.swift` | Параметры и пресеты |
+| `AudioDegrader.swift` | PCM sample-and-hold и bitcrush с сохранением временной шкалы |
+| `DatamoshDocument.swift` | Сегменты, ограничения, история и пресеты точек |
+| `DatamoshRenderer.swift` | Metal ping-pong, блочная оценка движения и оптический поток |
+| `DatamoshMedia.swift` | Временная шкала, скраббинг, авто-точки и последовательный экспорт |
+| `DatamoshEditor.swift`, `DatamoshEditorModel.swift` | Редактор, отмена задач и владение ресурсами |
 
 Файлы находятся в `Trenches/Sources/Trenches/`. Новые API ограничены `#available(iOS 26.0, *)`; старые устройства используют совместимый путь. Поздние кадры отбрасываются, очереди ограничены. Камера/качество/источник глубины переключаются между записями.
 

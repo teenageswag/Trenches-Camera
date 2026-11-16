@@ -35,6 +35,15 @@ enum PipelineVerification {
             let stationary = try renderer.render(image, depth: nil, settings: motion, time: 1 + 1.0 / 30)
             guard bytes(stationary) == baselineBytes else { throw TrenchesError.message("Motion blur размывает статичный кадр") }
             record("PASS stationary motion blur / temporal initialization")
+            let checkerImage = CIFilter(name: "CICheckerboardGenerator", parameters: ["inputWidth": 13, "inputSharpness": 1])!.outputImage!
+            let moving = checkerImage.transformed(by: CGAffineTransform(translationX: 7, y: 3)).cropped(to: bounds)
+            renderer.resetMotion()
+            _ = try renderer.render(checkerImage.cropped(to: bounds), depth: nil, settings: motion, time: 2)
+            let motionOutput = try renderer.render(moving, depth: nil, settings: motion, time: 2 + 1.0 / 30)
+            let movingSharp = try renderer.render(moving, depth: nil, settings: EffectSettings(), time: 3)
+            guard bytes(motionOutput) != bytes(movingSharp) else { throw TrenchesError.message("Motion blur не реагирует на движение") }
+            record("PASS motion-dependent blur on translated checkerboard")
+            try await verifyDatamosh(renderer: renderer, record: record)
             var stacked = EffectSettings()
             EffectID.allCases.forEach { stacked.toggle($0) }
             let output = try renderer.render(image, depth: nil, settings: stacked, time: 2)
@@ -75,6 +84,101 @@ enum PipelineVerification {
         let report = lines.joined(separator: "\n")
         if let directory = try? CaptureLibrary.directory().deletingLastPathComponent() { try? report.write(to: directory.appendingPathComponent("verification.txt"), atomically: true, encoding: .utf8) }
         return report
+    }
+
+    private static func verifyDatamosh(renderer: FrameRenderer, record: (String) -> Void) async throws {
+        let bounds = CGRect(x: 0, y: 0, width: 96, height: 160)
+        let checker = CIFilter(name: "CICheckerboardGenerator", parameters: ["inputWidth": 11, "inputSharpness": 1])!.outputImage!
+        var inputs: [CVPixelBuffer] = []
+        for i in 0..<14 {
+            var image = checker.transformed(by: CGAffineTransform(translationX: CGFloat(i * 4), y: CGFloat(i * 2))).cropped(to: bounds)
+            image = image.applyingFilter("CIColorMatrix", parameters: ["inputRVector": CIVector(x: i < 3 ? 1 : 0.2, y: 0, z: 0, w: 0), "inputBVector": CIVector(x: 0, y: 0, z: i < 3 ? 0.2 : 1, w: 0)])
+            var buffer: CVPixelBuffer?
+            guard CVPixelBufferCreate(nil, 96, 160, kCVPixelFormatType_32BGRA,
+                [kCVPixelBufferMetalCompatibilityKey: true, kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer) == kCVReturnSuccess, let buffer else {
+                throw TrenchesError.message("Не удалось создать тестовый кадр")
+            }
+            renderer.context.render(image, to: buffer, bounds: bounds, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+            inputs.append(buffer)
+        }
+        let clean = try DatamoshRenderer(width: 96, height: 160, referenceWidth: 96)
+        for mode in DatamoshMode.allCases {
+            var segment = DatamoshSegment(start: 2, duration: 10, mode: mode)
+            segment.values["strength"] = 1; segment.values["fraction"] = 1
+            segment.values["distortion"] = 3
+            let doc = DatamoshDocument(segments: [segment])
+            let a = try DatamoshRenderer(width: 96, height: 160, referenceWidth: 96)
+            let b = try DatamoshRenderer(width: 96, height: 160, referenceWidth: 96)
+            var changed = false
+            for frame in inputs.indices {
+                let result = try a.render(inputs[frame], frame: frame, document: doc)
+                let repeatResult = try b.render(inputs[frame], frame: frame, document: doc)
+                let baseline = try clean.render(inputs[frame], frame: frame, document: DatamoshDocument())
+                guard bytes(result) == bytes(repeatResult) else { throw TrenchesError.message("Datamosh \(mode.rawValue): недетерминированный seed") }
+                if frame < 2 || frame >= 12 {
+                    guard bytes(result) == bytes(baseline) else { throw TrenchesError.message("Datamosh меняет кадр вне сегмента") }
+                } else if bytes(result) != bytes(baseline) { changed = true }
+            }
+            guard changed else { throw TrenchesError.message("Datamosh \(mode.rawValue): эффект не проявился") }
+            record("PASS Datamosh \(mode.rawValue) / deterministic seed / segment boundaries")
+        }
+        var optical = DatamoshSegment(start: 0, duration: 14)
+        optical.values["estimation"] = 1; optical.values["reset"] = 5
+        let flow = try DatamoshRenderer(width: 96, height: 160, referenceWidth: 96)
+        let doc = DatamoshDocument(segments: [optical], resets: [8])
+        for frame in inputs.indices {
+            let result = try flow.render(inputs[frame], frame: frame, document: doc)
+            if [0, 5, 8, 10].contains(frame) {
+                let baseline = try clean.render(inputs[frame], frame: frame, document: DatamoshDocument())
+                guard bytes(result) == bytes(baseline) else { throw TrenchesError.message("Datamosh не сбросил накопление") }
+            }
+        }
+        record("PASS dense optical flow / interval and manual buffer resets")
+        var shakal = EffectSettings(); shakal.toggle(.shakal); shakal.set(.shakal, "audio", 1)
+        let degraded = try AudioDegrader().process(RenderBenchmark.audio(at: 1), settings: shakal)
+        guard CMSampleBufferGetNumSamples(degraded) == 1600, CMSampleBufferGetPresentationTimeStamp(degraded) == CMTime(value: 1, timescale: 30) else { throw TrenchesError.message("Шакализация нарушила время звука") }
+        record("PASS PCM audio degradation / sample count and timing")
+        let recorder = try MovieRecorder(width: 96, height: 160, fps: 30, includeAudio: true)
+        for frame in inputs.indices {
+            try recorder.appendVideo(inputs[frame], at: CMTime(value: Int64(frame), timescale: 30))
+            try recorder.appendAudio(RenderBenchmark.audio(at: frame))
+        }
+        let source: URL = try await withCheckedThrowingContinuation { continuation in recorder.finish { continuation.resume(with: $0) } }
+        defer { try? FileManager.default.removeItem(at: source) }
+        let token = DatamoshCancellation()
+        let media = try await DatamoshMedia.open(source, cancellation: token)
+        let worker = DatamoshWorker()
+        var mixed = DatamoshDocument()
+        for (index, mode) in DatamoshMode.allCases.enumerated() {
+            var segment = DatamoshSegment(start: index * 2, duration: 2, mode: mode)
+            segment.values["estimation"] = index % 2 == 0 ? 1 : 0
+            try mixed.put(segment, frameCount: media.frameCount)
+        }
+        let full = try worker.export(media, document: mixed, preview: false, cancellation: token) { _ in }
+        defer { try? FileManager.default.removeItem(at: full) }
+        let exported = try await DatamoshMedia.open(full, cancellation: token)
+        guard exported.frameCount == media.frameCount, exported.audio != nil, abs(exported.seconds - media.seconds) < 0.05 else { throw TrenchesError.message("Datamosh потерял кадры, звук или длительность") }
+        guard try audioBytes(media) == audioBytes(exported) else { throw TrenchesError.message("Datamosh изменил сжатые звуковые пакеты") }
+        let straight = try worker.preview(media, document: mixed, frame: 9, cancellation: token)
+        worker.clear()
+        let repeated = try worker.preview(media, document: mixed, frame: 9, cancellation: token)
+        guard straight.0.pngData() == repeated.0.pngData() else { throw TrenchesError.message("Скраббинг Datamosh зависит от истории") }
+        record("PASS mixed-mode MOV export / bit-exact compressed audio / exact frame count / deterministic scrubbing")
+    }
+
+    private static func audioBytes(_ media: DatamoshMedia) throws -> Data {
+        let (reader, output) = try media.reader(audioOnly: true)
+        defer { reader.cancelReading() }
+        var result = Data()
+        while let sample = output.copyNextSampleBuffer() {
+            guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
+            var bytes = [UInt8](repeating: 0, count: CMBlockBufferGetDataLength(block))
+            let status = bytes.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!) }
+            guard status == noErr else { throw TrenchesError.message("Не удалось проверить звуковые пакеты") }
+            result.append(contentsOf: bytes)
+        }
+        if let error = reader.error { throw error }
+        return result
     }
 
     private static func bytes(_ buffer: CVPixelBuffer) -> [UInt8] {
@@ -166,7 +270,7 @@ private final class RenderBenchmark: @unchecked Sendable {
         catch { complete(.failure(error)) }
     }
 
-    private static func audio(at frame: Int) throws -> CMSampleBuffer {
+    static func audio(at frame: Int) throws -> CMSampleBuffer {
         let count = 1600
         var description = AudioStreamBasicDescription(mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM, mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
         var format: CMAudioFormatDescription?

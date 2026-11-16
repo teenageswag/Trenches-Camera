@@ -53,6 +53,7 @@ private struct CaptureDetail: View {
     @Environment(\.dismiss) private var dismiss
     @State private var player: AVPlayer?
     @State private var image: UIImage?
+    @State private var editingDatamosh = false
     var body: some View {
         NavigationStack {
             Group {
@@ -67,12 +68,16 @@ private struct CaptureDetail: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Готово") { dismiss() } }
                 ToolbarItem(placement: .primaryAction) { ShareLink(item: capture.url) { Image(systemName: "square.and.arrow.up") }.accessibilityLabel("Поделиться") }
+                if capture.isVideo {
+                    ToolbarItem(placement: .bottomBar) { Button("Открыть Datamosh") { player?.pause(); editingDatamosh = true } }
+                }
             }
             .task {
                 if capture.isVideo { player = AVPlayer(url: capture.url); player?.play() }
                 else { image = UIImage(contentsOfFile: capture.url.path) }
             }
             .onDisappear { player?.pause(); player = nil }
+            .fullScreenCover(isPresented: $editingDatamosh) { DatamoshEditor(url: capture.url) }
         }
     }
 }

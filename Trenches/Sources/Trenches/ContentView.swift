@@ -22,6 +22,7 @@ struct ContentView: View {
     @State private var grid = false
     @State private var pinchStart: Double?
     @State private var showZoom = false
+    @State private var editorPresentation: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 4) {
@@ -36,16 +37,21 @@ struct ContentView: View {
         .foregroundStyle(TrenchesTheme.paper)
         .task { await model.activate() }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await model.activate() } }
+            if phase == .active, model.pendingDatamoshCapture != nil { presentDatamosh() }
+            else if phase == .active, model.datamoshCapture == nil, panel != .library { Task { await model.activate() } }
             else if phase == .background { model.service.suspend() }
         }
+        .onChange(of: model.pendingDatamoshCapture?.id) { _, _ in presentDatamosh() }
         .onChange(of: model.status.recording) { _, recording in UIApplication.shared.isIdleTimerDisabled = recording }
-        .sheet(item: $panel) { panel in
+        .sheet(item: $panel, onDismiss: {
+            if model.pendingDatamoshCapture != nil { presentDatamosh() }
+            else if model.datamoshCapture == nil { Task { await model.activate() } }
+        }) { panel in
             switch panel {
             case .effects: EffectsPanel(model: model)
             case .presets: PresetsPanel(model: model)
             case .settings: CaptureSettingsPanel(model: model, grid: $grid)
-            case .library: CaptureLibraryView()
+            case .library: CaptureLibraryView().onAppear { model.service.suspend() }
             }
         }
         .sheet(item: $selectedEffect) { effect in
@@ -54,9 +60,25 @@ struct ContentView: View {
                 .presentationBackgroundInteraction(.enabled(upThrough: .medium))
                 .presentationDragIndicator(.visible)
         }
+        .fullScreenCover(item: $model.datamoshCapture, onDismiss: { Task { await model.activate() } }) { capture in
+            DatamoshEditor(url: capture.url) { model.latestURL = $0 }
+                .onAppear { model.service.suspend() }
+        }
         .alert("trenches", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("Понятно", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
+    }
+
+    private func presentDatamosh() {
+        guard scenePhase == .active, !model.status.recording, let capture = model.pendingDatamoshCapture else { return }
+        panel = nil; selectedEffect = nil
+        editorPresentation?.cancel()
+        editorPresentation = Task {
+            // SwiftUI must finish dismissing a settings sheet before presenting the editor.
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled, scenePhase == .active, model.pendingDatamoshCapture?.id == capture.id else { return }
+            model.datamoshCapture = capture; model.pendingDatamoshCapture = nil
+        }
     }
 
     private var header: some View {

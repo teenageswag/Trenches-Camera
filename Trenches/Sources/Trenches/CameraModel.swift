@@ -10,6 +10,8 @@ final class CameraModel: ObservableObject {
     @Published var requesting = true
     @Published var error: String?
     @Published var latestURL: URL?
+    @Published var datamoshCapture: DatamoshCapture?
+    @Published var pendingDatamoshCapture: DatamoshCapture?
     @Published var settings: EffectSettings {
         didSet {
             service.update(settings)
@@ -35,6 +37,7 @@ final class CameraModel: ObservableObject {
             }
         }
         service.onError = { [weak self] error in Task { @MainActor in self?.error = error } }
+        service.onVideoRecorded = { [weak self] url in Task { @MainActor in self?.pendingDatamoshCapture = DatamoshCapture(url: url) } }
         service.onSaved = { [weak self] url, _ in Task { @MainActor in
             self?.latestURL = url
             UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -42,8 +45,8 @@ final class CameraModel: ObservableObject {
         service.update(settings)
     }
 
-    var controlsLocked: Bool { status.recording || status.finishing || status.photoBusy }
-    var captureAvailable: Bool { status.running && !status.finishing && !status.photoBusy }
+    var controlsLocked: Bool { status.recording || status.finishing || status.photoBusy || pendingDatamoshCapture != nil || datamoshCapture != nil }
+    var captureAvailable: Bool { status.running && !status.finishing && !status.photoBusy && pendingDatamoshCapture == nil && datamoshCapture == nil }
     var depthWarning: String? {
         guard settings.wantsDepth else { return nil }
         if !status.depthAvailable { return "Карта глубины недоступна. Выберите 1× или фронтальную камеру и 1080p · 30, либо художественный DOF." }

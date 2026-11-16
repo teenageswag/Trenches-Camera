@@ -132,6 +132,117 @@ kernel void motionBlur(texture2d<float, access::sample> source [[texture(0)]],
     target.write(mix(original, sum / weight, p[1].y), gid);
 }
 
+kernel void copyFrame(texture2d<float, access::sample> source [[texture(0)]],
+                      texture2d<float, access::write> target [[texture(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    target.write(source.sample(linearSampler, (float2(gid) + 0.5) / float2(target.get_width(), target.get_height())), gid);
+}
+
+// Coarse-to-fine iterative Lucas-Kanade. Each pass warps the previous image and solves
+// the local brightness-constancy system; regularization rejects flat/noisy regions.
+kernel void opticalFlow(texture2d<float, access::sample> current [[texture(0)]],
+                        texture2d<float, access::sample> previous [[texture(1)]],
+                        texture2d<float, access::sample> coarse [[texture(2)]],
+                        texture2d<float, access::write> target [[texture(3)]],
+                        constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 size = float2(target.get_width(), target.get_height());
+    float2 uv = (float2(gid) + 0.5) / size;
+    float2 vector = p[0].x > 0.5 ? coarse.sample(linearSampler, uv).xy * size / float2(coarse.get_width(), coarse.get_height()) : float2(0);
+    float xx = 0.001, yy = 0.001, xy = 0, xt = 0, yt = 0;
+    float residual = 0;
+    for (int y = -2; y <= 2; ++y) for (int x = -2; x <= 2; ++x) {
+        float2 point = uv + float2(x, y) / size;
+        float2 warped = point + vector / size;
+        float dx = (luminance(previous.sample(linearSampler, warped + float2(1.0 / size.x, 0)).rgb) -
+                    luminance(previous.sample(linearSampler, warped - float2(1.0 / size.x, 0)).rgb)) * 0.5;
+        float dy = (luminance(previous.sample(linearSampler, warped + float2(0, 1.0 / size.y)).rgb) -
+                    luminance(previous.sample(linearSampler, warped - float2(0, 1.0 / size.y)).rgb)) * 0.5;
+        float dt = luminance(previous.sample(linearSampler, warped).rgb) - luminance(current.sample(linearSampler, point).rgb);
+        xx += dx * dx; yy += dy * dy; xy += dx * dy; xt += dx * dt; yt += dy * dt;
+        residual += abs(dt);
+    }
+    float determinant = xx * yy - xy * xy;
+    float2 update = float2(xy * yt - yy * xt, xy * xt - xx * yt) / max(determinant, 0.000001);
+    vector += clamp(update, -3.0, 3.0);
+    float difference = abs(luminance(current.sample(linearSampler, uv).rgb) - luminance(previous.sample(linearSampler, uv).rgb));
+    float confidence = smoothstep(0.003, 0.02, difference);
+    vector *= confidence;
+    target.write(float4(clamp(vector, -96.0, 96.0), residual / 25.0, confidence), gid);
+}
+
+kernel void accumulateVectors(texture2d<float, access::sample> field [[texture(0)]],
+                              texture2d<float, access::sample> previous [[texture(1)]],
+                              texture2d<float, access::write> target [[texture(2)]],
+                              constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
+    float2 history = p[0].z > 0.5 ? previous.sample(linearSampler, uv).xy : float2(0);
+    float2 velocity = history * p[0].y + field.sample(linearSampler, uv).xy * p[0].x;
+    target.write(float4(clamp(velocity, -128.0, 128.0), 0, 1), gid);
+}
+
+kernel void motionActivity(texture2d<float, access::read> field [[texture(0)]],
+                           constant float4 *p [[buffer(0)]], device atomic_uint *activity [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= field.get_width() || gid.y >= field.get_height()) return;
+    if (length(field.read(gid).xy) * p[0].x > 0.5) atomic_fetch_add_explicit(activity, 1u, memory_order_relaxed);
+}
+
+kernel void datamoshCompose(texture2d<float, access::sample> current [[texture(0)]],
+                            texture2d<float, access::sample> previous [[texture(1)]],
+                            texture2d<float, access::sample> history [[texture(2)]],
+                            texture2d<float, access::sample> anchor [[texture(3)]],
+                            texture2d<float, access::sample> field [[texture(4)]],
+                            texture2d<float, access::sample> accumulated [[texture(5)]],
+                            texture2d<float, access::write> target [[texture(6)]],
+                            constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 size = float2(target.get_width(), target.get_height());
+    float2 uv = (float2(gid) + 0.5) / size;
+    int mode = int(p[0].x);
+    float strength = p[0].y;
+    float3 source = current.sample(linearSampler, uv).rgb;
+    float2 vector = field.sample(linearSampler, uv).xy * p[3].x;
+    uint hash = blockHash(uint2(floor(float2(gid) / max(p[0].z, 0.1))), uint(p[0].w), uint(p[2].w));
+    if (mode == 1) vector = accumulated.sample(linearSampler, uv).xy * p[3].x;
+    if (mode == 5) {
+        int kind = int(p[2].x);
+        float amount = p[2].y;
+        if (kind == 0) vector *= -amount;
+        else if (kind == 1) vector *= 1.0 + amount * 3.0;
+        else if (kind == 2) {
+            float angle = amount * M_PI_F * 0.5;
+            vector = float2(vector.x * cos(angle) - vector.y * sin(angle), vector.x * sin(angle) + vector.y * cos(angle));
+        } else vector += corruptedBlockOffset(hash, amount * 24.0 * p[3].y, max(p[0].z, 0.1));
+    }
+    vector *= strength;
+    float2 warpedUV = uv + vector / size;
+    float3 warped = history.sample(linearSampler, warpedUV).rgb;
+    float3 output = source;
+    if (mode == 2) {
+        float difference = length(source - previous.sample(linearSampler, uv).rgb) / sqrt(3.0);
+        float moving = smoothstep(p[1].z, p[1].z * 1.5 + 0.001, difference);
+        output = mix(anchor.sample(linearSampler, uv).rgb, source, moving);
+        output = mix(source, output, strength);
+    } else if (mode == 4) {
+        if (blockRandom(hash) < p[1].w) {
+            float2 offset = corruptedBlockOffset(hash, 96.0 * p[3].y, max(p[0].z, 0.1)) / size;
+            float3 corrupt = blockRandom(hash * 1664525u) < 0.5 ? history.sample(linearSampler, uv).rgb : anchor.sample(linearSampler, uv + offset).rgb;
+            output = mix(source, corrupt, strength);
+        }
+    } else if (mode == 6) {
+        // Recursive exponential history: trail controls the effective decay length in frames.
+        float feedback = pow(max(p[1].y, 0.001), 1.0 / max(p[2].z, 1.0)) * strength;
+        output = mix(source, history.sample(linearSampler, uv).rgb, min(feedback, 0.995));
+    } else {
+        float3 residual = source - previous.sample(linearSampler, warpedUV).rgb;
+        float retention = mix(0.0, 0.995, strength);
+        if (mode == 3 || mode == 1) retention = strength;
+        output = mix(source, warped + residual * (1.0 - strength), retention);
+    }
+    target.write(float4(clamp(output, 0.0, 1.0), 1), gid);
+}
+
 kernel void grade(texture2d<float, access::sample> source [[texture(0)]],
                   texture2d<float, access::sample> blurred [[texture(1)]],
                   texture2d<float, access::sample> depth [[texture(2)]],
