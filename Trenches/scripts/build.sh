@@ -6,7 +6,7 @@ build_dir="${XDG_CACHE_HOME:-$HOME/.cache}/trenches-build"
 mkdir -p "$build_dir"
 # xtool's Foundation bundle copier cannot preserve NTFS directory metadata.
 # Keep source on Windows, and compile/package on WSL's ext4 filesystem.
-rsync -rlt --exclude .build --exclude .bsp --exclude xtool --exclude diagnostics --exclude __pycache__ --exclude '*.log' "$project_dir/" "$build_dir/"
+rsync -rlt --delete --exclude .build --exclude .bsp --exclude xtool --exclude diagnostics --exclude __pycache__ --exclude '*.log' "$project_dir/" "$build_dir/"
 cd "$build_dir"
 if [[ "${TRENCHES_VERIFY:-0}" == 1 ]]; then
     python3 - <<'PY'

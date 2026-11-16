@@ -90,6 +90,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             desiredRunning = false
             if recorder != nil { stopRecordingOwned() }
             session?.stopRunning()
+            renderer?.resetMotion()
             status.running = false
             publish()
         }
@@ -186,6 +187,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             observers.removeAll()
             session = newSession; device = camera
             sessionGeneration &+= 1
+            renderer?.resetMotion()
             preview.clear()
             fpsStart = CACurrentMediaTime(); fpsFrames = 0; renderDroppedFrames = 0
             videoOutput = video; photoOutput = photo; audioOutput = audio; depthOutput = depth; synchronizer = sync

@@ -19,6 +19,7 @@ enum PipelineVerification {
             guard baselineBytes.max() == 255, Set(baselineBytes).count > 32 else { throw TrenchesError.message("Пустой базовый рендер") }
             record("PASS nonempty BGRA render")
             for effect in EffectID.allCases {
+                if effect == .motion { continue }
                 var settings = EffectSettings()
                 settings.toggle(effect)
                 if effect == .tone { settings.set(.tone, "exposure", 1) }
@@ -27,6 +28,13 @@ enum PipelineVerification {
                 guard bytes(output) != baselineBytes else { throw TrenchesError.message("Эффект \(effect.rawValue) не изменил кадр") }
                 record("PASS effect \(effect.rawValue)")
             }
+            var motion = EffectSettings()
+            motion.toggle(.motion)
+            renderer.resetMotion()
+            _ = try renderer.render(image, depth: nil, settings: motion, time: 1)
+            let stationary = try renderer.render(image, depth: nil, settings: motion, time: 1 + 1.0 / 30)
+            guard bytes(stationary) == baselineBytes else { throw TrenchesError.message("Motion blur размывает статичный кадр") }
+            record("PASS stationary motion blur / temporal initialization")
             var stacked = EffectSettings()
             EffectID.allCases.forEach { stacked.toggle($0) }
             let output = try renderer.render(image, depth: nil, settings: stacked, time: 2)

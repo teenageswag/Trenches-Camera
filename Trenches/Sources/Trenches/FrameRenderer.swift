@@ -19,6 +19,8 @@ final class FrameRenderer {
     private let finish: MTLComputePipelineState
     private let asciiPrepare: MTLComputePipelineState
     private let jpegDegrade: MTLComputePipelineState
+    private let motionEstimate: MTLComputePipelineState
+    private let motionBlur: MTLComputePipelineState
     private let atlas: MTLTexture
     private var cache: CVMetalTextureCache!
     private var pool: CVPixelBufferPool?
@@ -28,6 +30,11 @@ final class FrameRenderer {
     private var intermediate: MTLTexture?
     private var asciiCells: MTLTexture?
     private var compressed: MTLTexture?
+    private var motionCurrent: MTLTexture?
+    private var motionPrevious: MTLTexture?
+    private var motionField: MTLTexture?
+    private var motionOutput: MTLTexture?
+    private var motionTime: Double?
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     init() throws {
@@ -49,6 +56,11 @@ final class FrameRenderer {
         finish = try device.makeComputePipelineState(function: finishFunction)
         asciiPrepare = try device.makeComputePipelineState(function: asciiFunction)
         jpegDegrade = try device.makeComputePipelineState(function: jpegFunction)
+        guard let estimate = library.makeFunction(name: "estimateMotion"), let blur = library.makeFunction(name: "motionBlur") else {
+            throw TrenchesError.message("Не найдены функции оценки движения.")
+        }
+        motionEstimate = try device.makeComputePipelineState(function: estimate)
+        motionBlur = try device.makeComputePipelineState(function: blur)
         atlas = try Self.makeAtlas(device)
         guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess else {
             throw TrenchesError.message("Не удалось создать кэш текстур.")
@@ -83,11 +95,17 @@ final class FrameRenderer {
     private func prepare(width: Int, height: Int) throws {
         guard size != CGSize(width: width, height: height) else { return }
         pool = nil; source = nil; blurred = nil; intermediate = nil; asciiCells = nil; compressed = nil
+        resetMotion()
         size = .zero
         CVMetalTextureCacheFlush(cache, 0)
         let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height, kCVPixelBufferMetalCompatibilityKey as String: true, kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
         guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess else { throw TrenchesError.message("Не удалось создать пул кадров.") }
         size = CGSize(width: width, height: height)
+    }
+
+    func resetMotion() {
+        motionTime = nil
+        motionCurrent = nil; motionPrevious = nil; motionField = nil; motionOutput = nil
     }
 
     private func scratch(_ cached: inout MTLTexture?, width: Int, height: Int, format: MTLPixelFormat = .rgba8Unorm) throws -> MTLTexture {
@@ -144,11 +162,6 @@ final class FrameRenderer {
               let outputReference, let outputTexture = CVMetalTextureGetTexture(outputReference) else { throw TrenchesError.message("Не удалось создать выходную текстуру.") }
         var input = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
         let bounds = CGRect(origin: .zero, size: size)
-        if settings.enabled(.motion), settings.value(.motion, "radius") > 0, settings.value(.motion, "mix") > 0 {
-            let motion = input.clampedToExtent().applyingFilter("CIMotionBlur", parameters: [kCIInputRadiusKey: settings.value(.motion, "radius") * Float(width) / 1080, kCIInputAngleKey: settings.value(.motion, "angle") * .pi / 180]).cropped(to: bounds)
-            let mix = settings.value(.motion, "mix")
-            input = mix >= 0.999 ? motion : input.applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: motion, kCIInputTimeKey: mix]).cropped(to: bounds)
-        }
         if settings.enabled(.bloom) {
             input = input.clampedToExtent().applyingFilter("CIBloom", parameters: [kCIInputRadiusKey: settings.value(.bloom, "radius") * Float(width) / 1080, kCIInputIntensityKey: settings.value(.bloom, "amount")]).cropped(to: CGRect(origin: .zero, size: size))
         }
@@ -162,11 +175,29 @@ final class FrameRenderer {
         }
         // Only Bloom before tone mapping needs values above SDR white.
         let sourceFormat: MTLPixelFormat = settings.enabled(.bloom) && settings.enabled(.tone) ? .rgba16Float : .rgba8Unorm
-        let source = try scratch(&self.source, width: width, height: height, format: sourceFormat)
+        var source = try scratch(&self.source, width: width, height: height, format: sourceFormat)
         let destination = CIRenderDestination(mtlTexture: source, commandBuffer: command)
         destination.isFlipped = true
         destination.colorSpace = colorSpace
         _ = try context.startTask(toRender: input, from: bounds, to: destination, at: .zero)
+        if settings.enabled(.motion), settings.value(.motion, "radius") > 0, settings.value(.motion, "mix") > 0 {
+            let w = min(width, 192), h = max(1, Int(Double(height) * Double(w) / Double(width)))
+            let current = try scratch(&motionCurrent, width: w, height: h)
+            let previous = try scratch(&motionPrevious, width: w, height: h)
+            MPSImageBilinearScale(device: device).encode(commandBuffer: command, sourceTexture: source, destinationTexture: current)
+            if let last = motionTime, time > last, time - last < 0.25 {
+                let field = try scratch(&motionField, width: (w + 7) / 8, height: (h + 7) / 8, format: .rgba16Float)
+                var motion = [SIMD4<Float>(8, 8, 0, 0), SIMD4(settings.value(.motion, "radius") * Float(width) / 1080, settings.value(.motion, "mix"), Float(width) / Float(w), 0)]
+                try encode(command, pipeline: motionEstimate, textures: [current, previous, field], parameters: &motion, width: field.width, height: field.height)
+                let output = try scratch(&motionOutput, width: width, height: height, format: sourceFormat)
+                try encode(command, pipeline: motionBlur, textures: [source, field, output], parameters: &motion, width: width, height: height)
+                source = output
+            }
+            guard let blit = command.makeBlitCommandEncoder() else { throw TrenchesError.message("Не удалось сохранить историю движения.") }
+            blit.copy(from: current, to: previous)
+            blit.endEncoding()
+            motionTime = time
+        } else { motionTime = nil }
         var blurTexture = source
         if settings.enabled(.dof) {
             blurTexture = try scratch(&blurred, width: width, height: height, format: sourceFormat)

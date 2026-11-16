@@ -6,6 +6,64 @@ constexpr sampler glyphSampler(coord::normalized, address::clamp_to_edge, filter
 
 float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
+float motionCost(texture2d<float, access::sample> current, texture2d<float, access::sample> previous,
+                 float2 origin, float2 offset, float block) {
+    float2 size = float2(current.get_width(), current.get_height());
+    float cost = 0;
+    for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) {
+        float2 point = origin + (float2(x, y) + 0.5) * block / 4.0;
+        cost += abs(luminance(current.sample(linearSampler, point / size).rgb) -
+                    luminance(previous.sample(linearSampler, (point + offset) / size).rgb));
+    }
+    return cost / 16.0;
+}
+
+// Backward vectors: a current pixel samples the previous frame at pixel + vector.
+// The zero-vector preference and noise floor prevent sensor noise from smearing a tripod shot.
+kernel void estimateMotion(texture2d<float, access::sample> current [[texture(0)]],
+                           texture2d<float, access::sample> previous [[texture(1)]],
+                           texture2d<float, access::write> field [[texture(2)]],
+                           constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= field.get_width() || gid.y >= field.get_height()) return;
+    float block = p[0].x;
+    float2 origin = float2(gid) * block;
+    float stationary = motionCost(current, previous, origin, float2(0), block);
+    float best = stationary;
+    float2 vector = float2(0);
+    for (int stepSize = int(p[0].y); stepSize >= 1; stepSize /= 2) {
+        float2 center = vector;
+        for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+            float2 candidate = center + float2(x, y) * stepSize;
+            float cost = motionCost(current, previous, origin, candidate, block) + length(candidate) * 0.0004;
+            if (cost < best) { best = cost; vector = candidate; }
+        }
+    }
+    float confidence = smoothstep(0.008, 0.035, stationary - best);
+    field.write(float4(vector * confidence, stationary, confidence), gid);
+}
+
+kernel void motionBlur(texture2d<float, access::sample> source [[texture(0)]],
+                       texture2d<float, access::sample> field [[texture(1)]],
+                       texture2d<float, access::write> target [[texture(2)]],
+                       constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 size = float2(target.get_width(), target.get_height());
+    float2 uv = (float2(gid) + 0.5) / size;
+    float2 vector = field.sample(linearSampler, uv).xy * p[1].z;
+    float distance = length(vector);
+    vector *= min(p[1].x, distance) / max(distance, 0.001);
+    float4 original = source.sample(linearSampler, uv);
+    if (distance < 0.5) { target.write(original, gid); return; }
+    float4 sum = float4(0);
+    float weight = 0;
+    for (int i = -6; i <= 6; ++i) {
+        float w = 1.0 - abs(float(i)) / 7.0;
+        sum += source.sample(linearSampler, uv + vector / size * (float(i) / 12.0)) * w;
+        weight += w;
+    }
+    target.write(mix(original, sum / weight, p[1].y), gid);
+}
+
 kernel void grade(texture2d<float, access::sample> source [[texture(0)]],
                   texture2d<float, access::sample> blurred [[texture(1)]],
                   texture2d<float, access::sample> depth [[texture(2)]],

@@ -23,7 +23,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .color: return "Баланс и характер цвета"
         case .post: return "Зерно, растр и цифровые артефакты"
         case .ascii: return "Из света в символы"
-        case .motion: return "Направленный смаз"
+        case .motion: return "Смаз по движению между кадрами"
         case .shakal: return "Пиксели, JPEG-блоки и потеря цвета"
         }
     }
@@ -77,7 +77,6 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("mix", "Смешивание", 0...1, 1)]
         case .motion: return [
             .slider("radius", "Длина смаза", 0...80, 16, unit: "px"),
-            .slider("angle", "Угол", -180...180, 15, unit: "°"),
             .slider("mix", "Смешивание", 0...1, 1)]
         case .shakal: return [
             .slider("quality", "Качество JPEG", 1...100, 14, unit: ""),
