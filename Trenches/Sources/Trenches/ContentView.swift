@@ -127,7 +127,7 @@ struct ContentView: View {
                     HStack {
                         lensControls
                         Spacer(minLength: 0)
-                        Text("\(model.status.fps) FPS").font(.system(size: 9, weight: .medium, design: .monospaced)).foregroundStyle(.white.opacity(0.75)).monospacedDigit()
+                        Text("[\(model.status.fps) FPS]").font(.system(size: 9, weight: .medium, design: .monospaced)).foregroundStyle(.white.opacity(0.75)).monospacedDigit()
                     }
                     effectsStrip
                 }.padding(.horizontal, 12).padding(.vertical, 4)
