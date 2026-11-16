@@ -96,7 +96,11 @@ final class DatamoshEditorModel: ObservableObject {
                 self.image = result.0; self.renderingPreview = false
                 self.noMovement = document.segment(at: frame).map { frame > $0.start + 1 && result.1 < 0.002 && $0.mode != .macroblock && $0.mode != .vector } ?? false
             } catch is CancellationError { }
-            catch { self.renderingPreview = false; self.error = error.localizedDescription }
+            catch {
+                guard !Task.isCancelled, !self.closed, self.previewToken === token else { return }
+                do { try token.check() } catch { return }
+                self.renderingPreview = false; self.error = error.localizedDescription
+            }
         }
     }
 

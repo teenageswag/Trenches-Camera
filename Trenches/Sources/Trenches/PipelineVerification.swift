@@ -140,7 +140,8 @@ enum PipelineVerification {
         record("PASS PCM audio degradation / sample count and timing")
         let recorder = try MovieRecorder(width: 96, height: 160, fps: 30, includeAudio: true)
         for frame in inputs.indices {
-            try recorder.appendVideo(inputs[frame], at: CMTime(value: Int64(frame), timescale: 30))
+            let time = CMTime(value: Int64(frame) * 33_333_333 + Int64(frame % 3) * 17, timescale: 1_000_000_000)
+            try recorder.appendVideo(inputs[frame], at: time)
             try recorder.appendAudio(RenderBenchmark.audio(at: frame))
         }
         let source: URL = try await withCheckedThrowingContinuation { continuation in recorder.finish { continuation.resume(with: $0) } }
@@ -163,6 +164,10 @@ enum PipelineVerification {
         worker.clear()
         let repeated = try worker.preview(media, document: mixed, frame: 9, cancellation: token)
         guard straight.0.pngData() == repeated.0.pngData() else { throw TrenchesError.message("Скраббинг Datamosh зависит от истории") }
+        for frame in [0, 13, 1, 12, 2, 11, 3, 10, 4, 9, 5, 8, 6, 7] {
+            _ = try worker.preview(media, document: mixed, frame: frame, cancellation: token)
+        }
+        record("PASS shuffled frame-exact scrubbing / fractional capture timestamps")
         record("PASS mixed-mode MOV export / bit-exact compressed audio / exact frame count / deterministic scrubbing")
     }
 
