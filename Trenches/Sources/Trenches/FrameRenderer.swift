@@ -21,6 +21,7 @@ final class FrameRenderer {
     private let jpegDegrade: MTLComputePipelineState
     private let motionEstimate: MTLComputePipelineState
     private let motionBlur: MTLComputePipelineState
+    private let macroblock: MTLComputePipelineState
     private let atlas: MTLTexture
     private var cache: CVMetalTextureCache!
     private var pool: CVPixelBufferPool?
@@ -35,6 +36,7 @@ final class FrameRenderer {
     private var motionField: MTLTexture?
     private var motionOutput: MTLTexture?
     private var motionTime: Double?
+    private var blockOutput: MTLTexture?
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     init() throws {
@@ -61,6 +63,8 @@ final class FrameRenderer {
         }
         motionEstimate = try device.makeComputePipelineState(function: estimate)
         motionBlur = try device.makeComputePipelineState(function: blur)
+        guard let blocks = library.makeFunction(name: "macroblockCorrupt") else { throw TrenchesError.message("Не найден Macroblock.") }
+        macroblock = try device.makeComputePipelineState(function: blocks)
         atlas = try Self.makeAtlas(device)
         guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess else {
             throw TrenchesError.message("Не удалось создать кэш текстур.")
@@ -220,7 +224,7 @@ final class FrameRenderer {
                 depthTexture = CVMetalTextureGetTexture(depthReference)
             }
         }
-        var p = [SIMD4<Float>](repeating: .zero, count: 16)
+        var p = [SIMD4<Float>](repeating: .zero, count: 18)
         func on(_ id: EffectID) -> Float { settings.enabled(id) ? 1 : 0 }
         p[0] = SIMD4(on(.dof), settings.value(.dof, "mode"), depthTexture == nil ? 0 : 1, 0)
         p[1] = SIMD4(settings.value(.dof, "focus"), settings.value(.dof, "range"), settings.value(.dof, "radius"), 0)
@@ -247,10 +251,17 @@ final class FrameRenderer {
         p[15] = SIMD4(settings.value(.ascii, "paperR"), settings.value(.ascii, "paperG"), settings.value(.ascii, "paperB"), 0)
         p[11] = SIMD4(on(.shakal), settings.value(.shakal, "quality"), settings.value(.shakal, "scale"), settings.value(.shakal, "chroma"))
         p[12] = SIMD4(settings.value(.shakal, "sampling"), settings.value(.shakal, "mix"), Float(width), Float(height))
+        p[16] = SIMD4(settings.value(.macroblock, "block") < 0.5 ? 8 : 16, settings.value(.macroblock, "amount"), settings.value(.macroblock, "fraction"), settings.value(.macroblock, "seed").rounded())
+        p[17].x = Float(floor(time * Double(settings.value(.macroblock, "rate"))).truncatingRemainder(dividingBy: 1_000_000))
         var graded = source
         if settings.enabled(.dof) || settings.enabled(.tone) || settings.enabled(.color) {
             graded = try scratch(&intermediate, width: width, height: height)
             try encode(command, pipeline: grade, textures: [source, blurTexture, depthTexture ?? atlas, graded], parameters: &p, width: width, height: height)
+        }
+        if settings.enabled(.macroblock) {
+            let blocks = try scratch(&blockOutput, width: width, height: height)
+            try encode(command, pipeline: macroblock, textures: [graded, blocks], parameters: &p, width: width, height: height)
+            graded = blocks
         }
         var compressedTexture = graded
         if settings.enabled(.shakal) {

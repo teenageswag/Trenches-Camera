@@ -1,7 +1,7 @@
 import Foundation
 
 enum EffectID: String, Codable, CaseIterable, Identifiable {
-    case dof, bloom, tone, color, post, ascii, motion, shakal
+    case dof, bloom, tone, color, post, ascii, motion, shakal, macroblock
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -13,6 +13,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .ascii: return "ASCII"
         case .motion: return "Motion blur"
         case .shakal: return "Шакализация"
+        case .macroblock: return "Macroblock"
         }
     }
     var subtitle: String {
@@ -25,6 +26,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .ascii: return "Из света в символы"
         case .motion: return "Смаз по движению между кадрами"
         case .shakal: return "Пиксели, JPEG-блоки и потеря цвета"
+        case .macroblock: return "Смещение блоков по времени и seed"
         }
     }
     var symbol: String {
@@ -37,9 +39,10 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .ascii: return "textformat.abc"
         case .motion: return "wind"
         case .shakal: return "square.grid.3x3"
+        case .macroblock: return "square.grid.4x3.fill"
         }
     }
-    var mark: String { ["()", "**", "+/-", "RGB", "///", "#", "~>", "jpg"][Self.allCases.firstIndex(of: self)!] }
+    var mark: String { ["()", "**", "+/-", "RGB", "///", "#", "~>", "jpg", "8×8"][Self.allCases.firstIndex(of: self)!] }
     var parameters: [EffectParameter] {
         switch self {
         case .dof: return [
@@ -92,6 +95,12 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("audioBits", "Разрядность звука", 3...16, 8, unit: "бит"),
             .slider("audioRate", "Частота звука", 2...48, 8, unit: "кГц"),
             .slider("audioMix", "Смешивание звука", 0...1, 1)]
+        case .macroblock: return [
+            .choice("block", "Размер блока", ["8×8 px", "16×16 px"]),
+            .slider("amount", "Смещение", 0...128, 32, unit: "px"),
+            .slider("fraction", "Доля блоков", 0...1, 0.3),
+            .slider("rate", "Обновление", 1...30, 12, unit: "Гц"),
+            .slider("seed", "Seed", 0...65535, 1, unit: "")]
         }
     }
 }

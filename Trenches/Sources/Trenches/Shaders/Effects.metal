@@ -6,6 +6,30 @@ constexpr sampler glyphSampler(coord::normalized, address::clamp_to_edge, filter
 
 float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
+uint blockHash(uint2 block, uint tick, uint seed) {
+    uint h = block.x * 374761393u + block.y * 668265263u + tick * 2246822519u + seed * 3266489917u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
+}
+
+float blockRandom(uint hash) { return float(hash & 0x00ffffffu) / 16777216.0; }
+
+float2 corruptedBlockOffset(uint hash, float amount, float block) {
+    float2 random = float2(blockRandom(hash * 1664525u + 1013904223u), blockRandom(hash * 22695477u + 1u));
+    return round((random * 2.0 - 1.0) * amount / block) * block;
+}
+
+kernel void macroblockCorrupt(texture2d<float, access::sample> source [[texture(0)]],
+                             texture2d<float, access::write> target [[texture(1)]],
+                             constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 size = float2(target.get_width(), target.get_height());
+    float block = p[16].x;
+    uint hash = blockHash(uint2(float2(gid) / block), uint(p[17].x), uint(p[16].w));
+    float2 offset = blockRandom(hash) < p[16].z ? corruptedBlockOffset(hash, p[16].y, block) : float2(0);
+    target.write(source.sample(glyphSampler, (float2(gid) + 0.5 + offset) / size), gid);
+}
+
 float motionCost(texture2d<float, access::sample> current, texture2d<float, access::sample> previous,
                  float2 origin, float2 offset, float block) {
     float2 size = float2(current.get_width(), current.get_height());
