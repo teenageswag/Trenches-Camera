@@ -93,10 +93,10 @@ python3 Trenches/scripts/read-verification.py --datamosh
 | `CameraModel.swift`, `ContentView.swift`, `EffectPanels.swift` | Состояние и SwiftUI-интерфейс |
 | `EffectSettings.swift` | Параметры и пресеты |
 | `AudioDegrader.swift` | PCM sample-and-hold и bitcrush с сохранением временной шкалы |
-| `DatamoshDocument.swift` | Сегменты, ограничения, история и пресеты точек |
-| `DatamoshRenderer.swift` | Metal ping-pong, блочная оценка движения и оптический поток |
-| `DatamoshMedia.swift` | Временная шкала, скраббинг, авто-точки и последовательный экспорт |
-| `DatamoshEditor.swift`, `DatamoshEditorModel.swift` | Редактор, отмена задач и владение ресурсами |
+| `DatamoshDocument.swift` | Диапазоны, ограничения, история и пресеты |
+| `DatamoshRenderer.swift` | Блочное предсказание на Metal, квантованный остаток и повреждённая опора |
+| `DatamoshMedia.swift` | Декодирование, скраббинг, поиск диапазонов и последовательный экспорт |
+| `DatamoshEditor.swift`, `DatamoshTimeline.swift`, `DatamoshEditorModel.swift` | Превью, таймлайн, зацикливание и отмена задач |
 
 Файлы находятся в `Trenches/Sources/Trenches/`. Новые API ограничены `#available(iOS 26.0, *)`; старые устройства используют совместимый путь. Поздние кадры отбрасываются, очереди ограничены. Камера/качество/источник глубины переключаются между записями.
 
