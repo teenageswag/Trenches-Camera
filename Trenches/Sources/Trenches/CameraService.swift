@@ -383,7 +383,8 @@ final class CameraService: NSObject, @unchecked Sendable {
             }
         }
         do {
-            try renderer.renderAsync(CIImage(cvPixelBuffer: buffer), depth: depth, settings: settings, time: time.seconds, completion: complete)
+            try renderer.renderAsync(CIImage(cvPixelBuffer: buffer), depth: depth, settings: settings, time: time.seconds,
+                                     frameDuration: 1.0 / Double(status.captureFPS), completion: complete)
         } catch { complete(.failure(error)) }
     }
 

@@ -20,8 +20,7 @@ final class FrameRenderer {
     private let finish: MTLComputePipelineState
     private let asciiPrepare: MTLComputePipelineState
     private let jpegDegrade: MTLComputePipelineState
-    private let motionEstimate: MTLComputePipelineState
-    private let motionBlur: MTLComputePipelineState
+    private let motionBlur: MotionBlur
     private let macroblock: MTLComputePipelineState
     private let brightPass: MTLComputePipelineState
     private let lensComposite: MTLComputePipelineState
@@ -35,11 +34,6 @@ final class FrameRenderer {
     private var intermediate: MTLTexture?
     private var asciiCells: MTLTexture?
     private var compressed: MTLTexture?
-    private var motionCurrent: MTLTexture?
-    private var motionPrevious: MTLTexture?
-    private var motionField: MTLTexture?
-    private var motionOutput: MTLTexture?
-    private var motionTime: Double?
     private var blockOutput: MTLTexture?
     private var highlights: MTLTexture?
     private var glow: MTLTexture?
@@ -65,11 +59,7 @@ final class FrameRenderer {
         finish = try device.makeComputePipelineState(function: finishFunction)
         asciiPrepare = try device.makeComputePipelineState(function: asciiFunction)
         jpegDegrade = try device.makeComputePipelineState(function: jpegFunction)
-        guard let estimate = library.makeFunction(name: "estimateMotion"), let blur = library.makeFunction(name: "motionBlur") else {
-            throw TrenchesError.message("Не найдены функции оценки движения.")
-        }
-        motionEstimate = try device.makeComputePipelineState(function: estimate)
-        motionBlur = try device.makeComputePipelineState(function: blur)
+        motionBlur = try MotionBlur(device: device, library: library)
         guard let blocks = library.makeFunction(name: "macroblockCorrupt") else { throw TrenchesError.message("Не найден Macroblock.") }
         macroblock = try device.makeComputePipelineState(function: blocks)
         guard let bright = library.makeFunction(name: "brightPass"), let lens = library.makeFunction(name: "lensComposite"),
@@ -124,10 +114,7 @@ final class FrameRenderer {
         size = CGSize(width: width, height: height)
     }
 
-    func resetMotion() {
-        motionTime = nil
-        motionCurrent = nil; motionPrevious = nil; motionField = nil; motionOutput = nil
-    }
+    func resetMotion() { motionBlur.reset() }
 
     private func scratch(_ cached: inout MTLTexture?, width: Int, height: Int, format: MTLPixelFormat = .rgba8Unorm) throws -> MTLTexture {
         if let cached, cached.width == width, cached.height == height, cached.pixelFormat == format { return cached }
@@ -155,9 +142,9 @@ final class FrameRenderer {
         return frame.output
     }
 
-    func renderAsync(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double,
+    func renderAsync(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double, frameDuration: Double = 1.0 / 30,
                      completion: @escaping (Result<CVPixelBuffer, Error>) -> Void) throws {
-        let frame = try encodeFrame(image, depth: depth, settings: settings, time: time)
+        let frame = try encodeFrame(image, depth: depth, settings: settings, time: time, frameDuration: frameDuration)
         let resources = frame.resources
         let output = frame.output
         frame.command.addCompletedHandler { command in
@@ -169,7 +156,7 @@ final class FrameRenderer {
         frame.command.commit()
     }
 
-    private func encodeFrame(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double) throws -> PendingFrame {
+    private func encodeFrame(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double, frameDuration: Double = 1.0 / 30) throws -> PendingFrame {
         let width = Int(image.extent.width), height = Int(image.extent.height)
         try prepare(width: width, height: height)
         guard let pool, let command = queue.makeCommandBuffer() else { throw TrenchesError.message("Не удалось подготовить кадр.") }
@@ -185,6 +172,7 @@ final class FrameRenderer {
         let bounds = CGRect(origin: .zero, size: size)
         var resources: [Any] = [image, outputReference]
         if settings.activeCount == 0 {
+            resetMotion()
             let destination = CIRenderDestination(mtlTexture: outputTexture, commandBuffer: command)
             destination.isFlipped = true
             destination.colorSpace = colorSpace
@@ -197,39 +185,22 @@ final class FrameRenderer {
         destination.isFlipped = true
         destination.colorSpace = colorSpace
         _ = try context.startTask(toRender: input, from: bounds, to: destination, at: .zero)
-        if settings.enabled(.motion), settings.value(.motion, "radius") > 0, settings.value(.motion, "mix") > 0 {
-            let w = min(width, 192), h = max(1, Int(Double(height) * Double(w) / Double(width)))
-            let current = try scratch(&motionCurrent, width: w, height: h)
-            let previous = try scratch(&motionPrevious, width: w, height: h)
-            MPSImageBilinearScale(device: device).encode(commandBuffer: command, sourceTexture: source, destinationTexture: current)
-            if let last = motionTime, time > last, time - last < 0.25 {
-                let field = try scratch(&motionField, width: (w + 7) / 8, height: (h + 7) / 8, format: .rgba16Float)
-                var motion = [SIMD4<Float>(8, 8, 0, 0), SIMD4(settings.value(.motion, "radius") * Float(width) / 1080, settings.value(.motion, "mix"), Float(width) / Float(w), 0)]
-                try encode(command, pipeline: motionEstimate, textures: [current, previous, field], parameters: &motion, width: field.width, height: field.height)
-                let output = try scratch(&motionOutput, width: width, height: height, format: sourceFormat)
-                try encode(command, pipeline: motionBlur, textures: [source, field, output], parameters: &motion, width: width, height: height)
-                source = output
-            }
-            guard let blit = command.makeBlitCommandEncoder() else { throw TrenchesError.message("Не удалось сохранить историю движения.") }
-            blit.copy(from: current, to: previous)
-            blit.endEncoding()
-            motionTime = time
-        } else { motionTime = nil }
+        source = try motionBlur.encode(source: source, command: command, settings: settings, time: time, frameDuration: frameDuration)
         if settings.enabled(.bloom) || settings.enabled(.lensFlare) {
             let w = max(1, width / 4), h = max(1, height / 4)
             let bright = try scratch(&highlights, width: w, height: h, format: .rgba16Float)
             let soft = try scratch(&glow, width: w, height: h, format: .rgba16Float)
-            var light = [SIMD4<Float>(settings.enabled(.lensFlare) ? settings.value(.lensFlare, "threshold") : 0.65,
+            let light = [SIMD4<Float>(settings.enabled(.lensFlare) ? settings.value(.lensFlare, "threshold") : 0.65,
                 settings.enabled(.bloom) ? settings.value(.bloom, "amount") : 0,
                 settings.enabled(.lensFlare) ? settings.value(.lensFlare, "amount") : 0,
                 settings.enabled(.lensFlare) ? settings.value(.lensFlare, "dirt") : 0)]
-            try encode(command, pipeline: brightPass, textures: [source, bright], parameters: &light, width: w, height: h)
+            try Self.encode(command, pipeline: brightPass, textures: [source, bright], parameters: light, width: w, height: h)
             let sigma = settings.enabled(.bloom) ? settings.value(.bloom, "radius") * Float(width) / 4320 : 6
             let blur = MPSImageGaussianBlur(device: device, sigma: max(0.5, sigma))
             blur.edgeMode = .clamp
             blur.encode(commandBuffer: command, sourceTexture: bright, destinationTexture: soft)
             let output = try scratch(&lightOutput, width: width, height: height, format: sourceFormat)
-            try encode(command, pipeline: lensComposite, textures: [source, bright, soft, dirt, output], parameters: &light, width: width, height: height)
+            try Self.encode(command, pipeline: lensComposite, textures: [source, bright, soft, dirt, output], parameters: light, width: width, height: height)
             source = output
         }
         var blurTexture = source
@@ -283,11 +254,11 @@ final class FrameRenderer {
         var graded = source
         if settings.enabled(.dof) || settings.enabled(.tone) || settings.enabled(.color) {
             graded = try scratch(&intermediate, width: width, height: height)
-            try encode(command, pipeline: grade, textures: [source, blurTexture, depthTexture ?? atlas, graded], parameters: &p, width: width, height: height)
+            try Self.encode(command, pipeline: grade, textures: [source, blurTexture, depthTexture ?? atlas, graded], parameters: p, width: width, height: height)
         }
         if settings.enabled(.macroblock) {
             let blocks = try scratch(&blockOutput, width: width, height: height)
-            try encode(command, pipeline: macroblock, textures: [graded, blocks], parameters: &p, width: width, height: height)
+            try Self.encode(command, pipeline: macroblock, textures: [graded, blocks], parameters: p, width: width, height: height)
             graded = blocks
         }
         var compressedTexture = graded
@@ -309,19 +280,19 @@ final class FrameRenderer {
             let w = max(1, Int(ceil(Float(width) / cell)))
             let h = max(1, Int(ceil(Float(height) / (cell * 1.5))))
             cells = try scratch(&asciiCells, width: w, height: h)
-            try encode(command, pipeline: asciiPrepare, textures: [graded, compressedTexture, cells], parameters: &p, width: w, height: h)
+            try Self.encode(command, pipeline: asciiPrepare, textures: [graded, compressedTexture, cells], parameters: p, width: w, height: h)
         }
-        try encode(command, pipeline: finish, textures: [graded, atlas, compressedTexture, cells, outputTexture], parameters: &p, width: width, height: height)
+        try Self.encode(command, pipeline: finish, textures: [graded, atlas, compressedTexture, cells, outputTexture], parameters: p, width: width, height: height)
         if let depthReference { resources.append(depthReference) }
         if let convertedDepth { resources.append(convertedDepth) }
         return PendingFrame(output: output, command: command, resources: resources)
     }
 
-    private func encode(_ command: MTLCommandBuffer, pipeline: MTLComputePipelineState, textures: [MTLTexture], parameters: inout [SIMD4<Float>], width: Int, height: Int) throws {
+    static func encode(_ command: MTLCommandBuffer, pipeline: MTLComputePipelineState, textures: [MTLTexture], parameters: [SIMD4<Float>], width: Int, height: Int) throws {
         guard let encoder = command.makeComputeCommandEncoder() else { throw TrenchesError.message("Metal не смог начать обработку.") }
         encoder.setComputePipelineState(pipeline)
         for (index, texture) in textures.enumerated() { encoder.setTexture(texture, index: index) }
-        parameters.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 0) }
+        if !parameters.isEmpty { parameters.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 0) } }
         let w = pipeline.threadExecutionWidth
         encoder.dispatchThreads(MTLSize(width: width, height: height, depth: 1), threadsPerThreadgroup: MTLSize(width: w, height: min(8, pipeline.maxTotalThreadsPerThreadgroup / w), depth: 1))
         encoder.endEncoding()
