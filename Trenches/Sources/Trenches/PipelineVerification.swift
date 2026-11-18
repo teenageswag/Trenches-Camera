@@ -28,6 +28,7 @@ enum PipelineVerification {
                 guard bytes(output) != baselineBytes else { throw TrenchesError.message("Эффект \(effect.rawValue) не изменил кадр") }
                 record("PASS effect \(effect.rawValue)")
             }
+            try verifyASCIIShadows(renderer: renderer, record: record)
             try verifyMotionBlur(renderer: renderer, record: record)
             try await verifyDatamosh(renderer: renderer, record: record)
             var stacked = EffectSettings()
@@ -70,6 +71,34 @@ enum PipelineVerification {
         let report = lines.joined(separator: "\n")
         if let directory = try? CaptureLibrary.directory().deletingLastPathComponent() { try? report.write(to: directory.appendingPathComponent("verification.txt"), atomically: true, encoding: .utf8) }
         return report
+    }
+
+    private static func verifyASCIIShadows(renderer: FrameRenderer, record: (String) -> Void) throws {
+        let width = 1080, height = 90, bandWidth = 216
+        let levels: [UInt8] = [0, 9, 28, 62, 235]
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        for y in 0..<height { for x in 0..<width {
+            let gray = levels[x / bandWidth], index = (y * width + x) * 4
+            pixels[index] = gray; pixels[index + 1] = gray; pixels[index + 2] = gray
+        } }
+        let image = CIImage(bitmapData: Data(pixels), bytesPerRow: width * 4, size: CGSize(width: width, height: height),
+                            format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        var settings = EffectSettings()
+        settings.toggle(.ascii)
+        settings.set(.ascii, "cell", 6); settings.set(.ascii, "contrast", 3); settings.set(.ascii, "palette", 4)
+        let output = bytes(try renderer.render(image, depth: nil, settings: settings, time: 1))
+        let ink = levels.indices.map { band in
+            (0..<height).reduce(0) { total, y in
+                total + (0..<bandWidth).reduce(0) { row, x in
+                    let i = (y * width + band * bandWidth + x) * 4
+                    return row + (output[i + 1] > 16 ? 1 : 0)
+                }
+            }
+        }
+        guard ink[0] == 0, ink[1] > 0, ink[2] > ink[1], ink[3] > 0, ink[4] > ink[2] else {
+            throw TrenchesError.message("ASCII 6 px/300% теряет детали в тенях: \(ink)")
+        }
+        record("PASS ASCII 6 px/300% / black background and shadow glyphs: \(ink)")
     }
 
     private static func verifyMotionBlur(renderer: FrameRenderer, record: (String) -> Void) throws {

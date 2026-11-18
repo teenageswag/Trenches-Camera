@@ -69,13 +69,13 @@ final class FrameRenderer {
         brightPass = try device.makeComputePipelineState(function: bright)
         lensComposite = try device.makeComputePipelineState(function: lens)
         dirt = try MTKTextureLoader(device: device).newTexture(URL: dirtURL, options: [.SRGB: false, .origin: MTKTextureLoader.Origin.topLeft])
-        atlas = try Self.makeAtlas(device)
+        atlas = try Self.makeAtlas(device, queue: queue)
         guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess else {
             throw TrenchesError.message("Не удалось создать кэш текстур.")
         }
     }
 
-    private static func makeAtlas(_ device: MTLDevice) throws -> MTLTexture {
+    private static func makeAtlas(_ device: MTLDevice, queue: MTLCommandQueue) throws -> MTLTexture {
         let columns = ASCIISymbols.allCases.map { $0.characters.count }.max()!
         let width = columns * 32, height = 48 * ASCIISymbols.allCases.count
         var bytes = [UInt8](repeating: 0, count: width * height)
@@ -93,13 +93,21 @@ final class FrameRenderer {
             }
             return true
         }
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: width, height: height, mipmapped: false)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: width, height: height, mipmapped: true)
         descriptor.usage = .shaderRead
         guard ok, let texture = device.makeTexture(descriptor: descriptor) else { throw TrenchesError.message("Не удалось создать ASCII-атлас.") }
         // Flipping the bitmap preserves the classic glyph orientation and puts mode 0 in the first texture row.
         var flipped = bytes
         for y in 0..<height { flipped.replaceSubrange((y * width)..<((y + 1) * width), with: bytes[((height - y - 1) * width)..<((height - y) * width)]) }
         flipped.withUnsafeBytes { texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: width) }
+        guard let command = queue.makeCommandBuffer(), let blit = command.makeBlitCommandEncoder() else {
+            throw TrenchesError.message("Не удалось подготовить масштабы ASCII-атласа.")
+        }
+        blit.generateMipmaps(for: texture)
+        blit.endEncoding()
+        command.commit()
+        command.waitUntilCompleted()
+        if let error = command.error { throw error }
         return texture
     }
 

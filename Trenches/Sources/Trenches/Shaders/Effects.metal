@@ -4,6 +4,8 @@ using namespace metal;
 constexpr sampler linearSampler(coord::normalized, address::clamp_to_edge, filter::linear);
 constexpr sampler glyphSampler(coord::normalized, address::clamp_to_edge, filter::nearest);
 
+constexpr sampler atlasSampler(coord::normalized, address::clamp_to_edge, filter::linear, mip_filter::linear);
+
 float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 uint blockHash(uint2 block, uint tick, uint seed) {
@@ -443,9 +445,15 @@ kernel void asciiPrepare(texture2d<float, access::sample> source [[texture(0)]],
     float2 cell = float2(p[9].y, p[9].y * 1.5) * size.x / 1080.0;
     float2 center = (float2(gid) + 0.5) * cell / size;
     float3 original = postSample(source, compressed, center, p, size);
-    float l = clamp((luminance(original) - 0.5) * p[9].z + 0.5, 0.0, 1.0);
-    if (p[10].x > 0.5) l = 1.0 - l;
-    float glyph = min(floor(l * p[10].w), p[10].w - 1.0);
+    float signal = clamp(luminance(original), 0.0, 1.0);
+    if (p[10].x > 0.5) signal = 1.0 - signal;
+    float l = clamp((signal - 0.5) * p[9].z + 0.5, 0.0, 1.0);
+    float count = p[10].w;
+    float glyph = min(floor(l * count), count - 1.0);
+    // Keep a few sparse glyphs in the toe where high contrast would turn every shadow into a space.
+    float toe = clamp((signal - 3.0 / 255.0) / (0.40 - 3.0 / 255.0), 0.0, 1.0);
+    float shadowGlyph = ceil(sqrt(toe) * clamp(floor(count / 3.0), 1.0, 3.0));
+    glyph = max(glyph, shadowGlyph);
     cells.write(float4(original, glyph / 255.0), gid);
 }
 
@@ -484,7 +492,13 @@ kernel void finish(texture2d<float, access::sample> source [[texture(0)]],
         float3 original = cellValue.rgb;
         float glyph = round(cellValue.a * 255.0);
         float2 local = fract(position);
-        float mask = atlas.sample(glyphSampler, float2((glyph + local.x) / float(atlas.get_width() / 32), (p[10].z + local.y) / 4.0)).r;
+        const float2 glyphSize = float2(32, 48);
+        // At 6 px one texel read can miss a thin stroke. Up to level 4 the atlas tiles are mip-aligned.
+        float lod = clamp(log2(glyphSize.x / cell.x), 0.0, 4.0);
+        float2 inset = 0.5 * exp2(ceil(lod)) / glyphSize;
+        float2 atlasPixel = (float2(glyph, p[10].z) + clamp(local, inset, 1.0 - inset)) * glyphSize;
+        float2 atlasUV = atlasPixel / float2(atlas.get_width(), atlas.get_height());
+        float mask = atlas.sample(atlasSampler, atlasUV, level(lod)).r;
         float3 ink = float3(0.91, 0.90, 0.84);
         if (p[9].w > 4.5) ink = mix(p[13].rgb, p[14].rgb, glyph / max(1.0, p[10].w - 1.0));
         else if (p[9].w > 3.5) ink = p[13].rgb;
