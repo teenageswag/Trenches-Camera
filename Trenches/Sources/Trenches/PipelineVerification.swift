@@ -164,15 +164,34 @@ enum PipelineVerification {
             }
         }
         record("PASS dense optical flow / interval and manual buffer resets")
+        let transfer = DatamoshDocument(segments: [
+            DatamoshSegment(start: 3, duration: 3, mode: .transfer, values: ["strength": 1], donorFrame: 0)
+        ], resets: [5])
+        let donor = try clean.render(inputs[0], frame: 0, document: DatamoshDocument())
+        flow.reset()
+        let cut = try flow.render(inputs[3], frame: 3, document: transfer, donor: inputs[0])
+        let held = try flow.render(inputs[3], frame: 4, document: transfer)
+        let restored = try flow.render(inputs[3], frame: 5, document: transfer)
+        let sourceFrame = try clean.render(inputs[3], frame: 3, document: DatamoshDocument())
+        guard bytes(cut) == bytes(donor), bytes(held) == bytes(donor), bytes(restored) == bytes(sourceFrame) else {
+            throw TrenchesError.message("Datamosh не сохранил повреждённую опору или не восстановил кадр при сбросе")
+        }
+        record("PASS wrong reference persists through skipped predictions / explicit donor / clean reset")
         var shakal = EffectSettings(); shakal.toggle(.shakal); shakal.set(.shakal, "audio", 1)
         let degraded = try AudioDegrader().process(RenderBenchmark.audio(at: 1), settings: shakal)
         guard CMSampleBufferGetNumSamples(degraded) == 1600, CMSampleBufferGetPresentationTimeStamp(degraded) == CMTime(value: 1, timescale: 30) else { throw TrenchesError.message("Шакализация нарушила время звука") }
         record("PASS PCM audio degradation / sample count and timing")
         let recorder = try MovieRecorder(width: 96, height: 160, fps: 30, includeAudio: true)
+        var finishedFixture = false
+        defer { if !finishedFixture { recorder.cancel() } }
         let captureStart = CMTime(value: 123_456_789_012_345, timescale: 1_000_000_000)
         for frame in inputs.indices {
             let time = CMTimeAdd(captureStart, CMTime(value: Int64(frame) * 33_333_333 + Int64(frame % 3) * 17, timescale: 1_000_000_000))
-            try recorder.appendVideo(inputs[frame], at: time)
+            for _ in 0..<12 where recorder.frameCount == frame {
+                try recorder.appendVideo(inputs[frame], at: time)
+                if recorder.frameCount == frame { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            guard recorder.frameCount == frame + 1 else { throw TrenchesError.message("Кодировщик пропустил тестовый кадр") }
             let audio = try RenderBenchmark.audio(at: frame)
             var timing = CMSampleTimingInfo()
             guard CMSampleBufferGetSampleTimingInfo(audio, at: 0, timingInfoOut: &timing) == noErr else { throw TrenchesError.message("Не удалось сдвинуть тестовый звук") }
@@ -180,17 +199,28 @@ enum PipelineVerification {
             var shifted: CMSampleBuffer?
             guard CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault, sampleBuffer: audio, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &shifted) == noErr,
                   let shifted else { throw TrenchesError.message("Не удалось сдвинуть тестовый звук") }
-            try recorder.appendAudio(shifted)
+            var wroteAudio = false
+            for _ in 0..<12 where !wroteAudio {
+                let dropped = recorder.droppedAudioSamples
+                try recorder.appendAudio(shifted)
+                wroteAudio = dropped == recorder.droppedAudioSamples
+                if !wroteAudio { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            guard wroteAudio else { throw TrenchesError.message("Кодировщик пропустил тестовый звук") }
+            try await Task.sleep(for: .milliseconds(34))
         }
         let source: URL = try await withCheckedThrowingContinuation { continuation in recorder.finish { continuation.resume(with: $0) } }
+        finishedFixture = true
         defer { try? FileManager.default.removeItem(at: source) }
         let token = DatamoshCancellation()
         let media = try await DatamoshMedia.open(source, cancellation: token)
+        guard media.frameCount == inputs.count else { throw TrenchesError.message("Тестовая запись содержит \(media.frameCount) из \(inputs.count) кадров") }
         let worker = DatamoshWorker()
         var mixed = DatamoshDocument()
         for (index, mode) in DatamoshMode.allCases.enumerated() {
             var segment = DatamoshSegment(start: index * 2, duration: 2, mode: mode)
             segment.values["estimation"] = index % 2 == 0 ? 1 : 0
+            if mode == .transfer { segment.donorFrame = 2 }
             try mixed.put(segment, frameCount: media.frameCount)
         }
         let full = try worker.export(media, document: mixed, preview: false, cancellation: token) { _ in }
@@ -205,6 +235,14 @@ enum PipelineVerification {
         for frame in [0, 13, 1, 12, 2, 11, 3, 10, 4, 9, 5, 8, 6, 7] {
             _ = try worker.preview(media, document: mixed, frame: frame, cancellation: token)
         }
+        let loop = try worker.export(media, document: mixed, preview: true, frames: 6..<9, cancellation: token) { _ in }
+        defer { try? FileManager.default.removeItem(at: loop) }
+        let loopMedia = try await DatamoshMedia.open(loop, cancellation: token)
+        guard loopMedia.frameCount == 3, loopMedia.audio != nil,
+              abs(loopMedia.seconds - CMTimeSubtract(media.times[9], media.times[6]).seconds) < 0.035 else {
+            throw TrenchesError.message("Datamosh обрезал превью диапазона с ошибкой")
+        }
+        record("PASS selected range proxy / clean endpoint / audio track")
         record("PASS shuffled frame-exact scrubbing / nonzero fractional capture clock / empty edit-list samples")
         record("PASS mixed-mode MOV export / bit-exact compressed audio / exact frame count / deterministic scrubbing")
     }

@@ -4,14 +4,15 @@ enum DatamoshMode: String, Codable, CaseIterable, Identifiable {
     case melt, bloom, freeze, transfer, macroblock, vector, echo
     var id: String { rawValue }
     var title: String { switch self {
-    case .melt: return "Melt / P-frame smear"
-    case .bloom: return "Bloom / накопление"
-    case .freeze: return "Freeze / Hold"
-    case .transfer: return "Transfer"
-    case .macroblock: return "Macroblock corruption"
-    case .vector: return "Vector glitch"
-    case .echo: return "Echo / Trail"
+    case .melt: return "Распад"
+    case .bloom: return "Залипание"
+    case .freeze: return "Стоп-кадр"
+    case .transfer: return "Перенос"
+    case .macroblock: return "Битые блоки"
+    case .vector: return "Сбой векторов"
+    case .echo: return "Шлейф"
     } }
+    static let featured: [Self] = [.transfer, .bloom, .macroblock]
     var symbol: String { switch self {
     case .melt: return "drop"
     case .bloom: return "arrow.up.left.and.arrow.down.right"
@@ -24,16 +25,17 @@ enum DatamoshMode: String, Codable, CaseIterable, Identifiable {
     var index: Int { Self.allCases.firstIndex(of: self)! }
     var parameters: [EffectParameter] { switch self {
     case .melt, .transfer: return []
-    case .bloom: return [.slider("accumulation", "Скорость накопления", 0...3, 0.7), .slider("decay", "Затухание векторов", 0...0.999, 0.96)]
+    case .bloom: return [.slider("repeat", "Повтор P-кадра", 2...96, 14, unit: "кадр."), .slider("accumulation", "Разгон движения", 0...3, 0.7), .slider("decay", "Затухание векторов", 0...0.999, 0.96)]
     case .freeze: return [.slider("threshold", "Порог движения", 0.005...0.5, 0.06)]
     case .macroblock: return [.slider("fraction", "Доля повреждённых блоков", 0...1, 0.4)]
     case .vector: return [.choice("distortion", "Искажение", ["Инверсия", "Умножение", "Поворот", "Шум"]), .slider("distortionAmount", "Сила искажения", 0...4, 1.5, unit: "×")]
     case .echo: return [.slider("trail", "Длина шлейфа", 1...120, 12, unit: "кадр."), .slider("decay", "Затухание шлейфа", 0.05...0.99, 0.7)]
     } }
     static var commonParameters: [EffectParameter] { [
-        .slider("strength", "Сила размазывания", 0...1, 0.85),
+        .slider("strength", "Сила сбоя", 0...1, 0.85),
         .choice("block", "Размер блока", ["8 px", "16 px", "32 px"]),
         .choice("estimation", "Оценка движения", ["Блочная · быстрее", "Оптический поток · качественнее"]),
+        .slider("recovery", "Восстановление перед концом", 0...90, 0, unit: "кадр."),
         .slider("reset", "Интервал авто-сброса (0 — выкл.)", 0...300, 0, unit: "кадр."),
         .slider("seed", "Seed", 0...65535, 1, unit: "")
     ] }
@@ -48,6 +50,7 @@ struct DatamoshSegment: Codable, Equatable, Identifiable {
     var mode = DatamoshMode.melt
     var end = DatamoshEnd.duration
     var values: [String: Float] = [:]
+    var donorFrame: Int?
     var endFrame: Int { start + duration }
     func value(_ key: String) -> Float {
         let parameter = (mode.parameters + DatamoshMode.commonParameters).first { $0.id == key }
@@ -57,14 +60,15 @@ struct DatamoshSegment: Codable, Equatable, Identifiable {
     }
     var blockSize: Int { [8, 16, 32][Int(value("block"))] }
     var resetInterval: Int { Int(value("reset").rounded()) }
+    var recoveryFrames: Int { min(duration - 1, Int(value("recovery").rounded())) }
 }
 
 enum DatamoshEditError: LocalizedError {
     case lastFrame, overlap, invalidRange
     var errorDescription: String? { switch self {
-    case .lastFrame: return "Точка на последнем кадре пропущена: после неё нет движения."
-    case .overlap: return "Сегменты не могут пересекаться. Сдвиньте точку или сократите длительность."
-    case .invalidRange: return "Сегмент должен занимать минимум два кадра и находиться внутри видео."
+    case .lastFrame: return "Для начала эффекта выберите кадр раньше последнего."
+    case .overlap: return "Диапазоны не могут пересекаться."
+    case .invalidRange: return "Диапазон должен занимать минимум два кадра и находиться внутри видео."
     } }
 }
 
@@ -77,6 +81,7 @@ struct DatamoshDocument: Codable, Equatable {
     mutating func put(_ segment: DatamoshSegment, frameCount: Int) throws {
         guard segment.start < frameCount - 1 else { throw DatamoshEditError.lastFrame }
         guard segment.start >= 0, segment.duration >= 2, segment.start <= frameCount - segment.duration else { throw DatamoshEditError.invalidRange }
+        if let donor = segment.donorFrame, !(0..<frameCount).contains(donor) { throw DatamoshEditError.invalidRange }
         guard !segments.contains(where: { $0.id != segment.id && segment.start < $0.endFrame && $0.start < segment.endFrame }) else { throw DatamoshEditError.overlap }
         segments.removeAll { $0.id == segment.id }
         segments.append(segment)
@@ -88,7 +93,7 @@ struct DatamoshDocument: Codable, Equatable {
         var start = segment.start
         if let marker = resets.filter({ $0 >= start && $0 <= frame }).max() { start = marker }
         if segment.resetInterval > 0 { start = max(start, segment.start + ((frame - segment.start) / segment.resetInterval) * segment.resetInterval) }
-        return segment.mode == .transfer && start == segment.start ? max(0, start - 1) : start
+        return segment.mode == .transfer && segment.donorFrame == nil && start == segment.start ? max(0, start - 1) : start
     }
 
     func validated(frameCount: Int) throws -> Self {
@@ -132,6 +137,7 @@ struct DatamoshPreset: Codable, Identifiable {
             segment.id = UUID()
             segment.start = min(count - 2, Int((Double(segment.start) * scale).rounded()))
             segment.duration = max(2, end - segment.start)
+            if let donor = segment.donorFrame { segment.donorFrame = min(count - 1, Int((Double(donor) * scale).rounded())) }
             if let previous = result.segments.last, segment.start < previous.endFrame { throw DatamoshEditError.overlap }
             try result.put(segment, frameCount: count)
         }

@@ -80,7 +80,7 @@ final class DatamoshMedia: @unchecked Sendable {
         return String(format: "%02d:%02d.%03d", Int(seconds) / 60, Int(seconds) % 60, Int(seconds * 1000) % 1000)
     }
 
-    func reader(start: Int = 0, audioOnly: Bool = false) throws -> (AVAssetReader, AVAssetReaderTrackOutput) {
+    func reader(start: Int = 0, audioOnly: Bool = false, timeRange: CMTimeRange? = nil) throws -> (AVAssetReader, AVAssetReaderTrackOutput) {
         let reader = try AVAssetReader(asset: asset)
         guard let track = audioOnly ? audio : video else { throw TrenchesError.message("Звуковая дорожка отсутствует.") }
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: audioOnly ? nil : [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -88,14 +88,35 @@ final class DatamoshMedia: @unchecked Sendable {
         output.alwaysCopiesSampleData = false
         guard reader.canAdd(output) else { throw TrenchesError.message("Декодер видео недоступен.") }
         reader.add(output)
-        if !audioOnly, start > 0 { reader.timeRange = CMTimeRange(start: times[start], end: duration) }
+        if let timeRange { reader.timeRange = timeRange }
+        else if !audioOnly, start > 0 { reader.timeRange = CMTimeRange(start: times[start], end: duration) }
         guard reader.startReading() else { throw reader.error ?? TrenchesError.message("Не удалось запустить декодер.") }
         return (reader, output)
     }
 
     func renderSize(preview: Bool) -> (Int, Int) {
-        let scale = preview ? min(1, 480 / max(size.width, size.height)) : 1
+        let scale = preview ? min(1, 720 / max(size.width, size.height)) : 1
         return (max(2, Int(size.width * scale) / 2 * 2), max(2, Int(size.height * scale) / 2 * 2))
+    }
+
+    func renderer(preview: Bool) throws -> DatamoshRenderer {
+        let (width, height) = renderSize(preview: preview)
+        return try DatamoshRenderer(width: width, height: height, referenceWidth: Int(size.width),
+                                    referenceHeight: Int(size.height), transform: transform)
+    }
+
+    func donor(for frame: Int, document: DatamoshDocument, cancellation: DatamoshCancellation) throws -> CVPixelBuffer? {
+        guard let segment = document.segment(at: frame), segment.start == frame, segment.mode == .transfer,
+              segment.value("strength") > 0, !document.resets.contains(frame), let donor = segment.donorFrame else { return nil }
+        let (reader, output) = try reader(start: max(0, donor - 2))
+        defer { reader.cancelReading() }
+        while let sample = output.copyNextSampleBuffer() {
+            try cancellation.check()
+            let index = decodedFrame(at: CMSampleBufferGetPresentationTimeStamp(sample))
+            if index > donor { break }
+            if index == donor, let buffer = CMSampleBufferGetImageBuffer(sample) { return buffer }
+        }
+        throw reader.error ?? TrenchesError.message("Не удалось прочитать кадр для переноса.")
     }
 }
 
@@ -116,28 +137,38 @@ final class DatamoshWorker: @unchecked Sendable {
     private var previewMovement = 0.0
     private var previewSegmentID: UUID?
     private var previewStart = 0
+    private var previewImages: [Int: (UIImage, Double)] = [:]
 
     func clear() {
+        resetPreview()
+        previewRenderer = nil; previewDocument = nil; previewURL = nil; previewImages.removeAll()
+    }
+
+    private func resetPreview() {
         previewReader?.cancelReading(); previewReader = nil; previewOutput = nil
-        previewRenderer = nil; previewDocument = nil; previewURL = nil; lastFrame = -2
+        previewRenderer?.reset(); lastFrame = -2
         previewMovement = 0; previewSegmentID = nil
     }
 
     func preview(_ media: DatamoshMedia, document: DatamoshDocument, frame: Int, cancellation: DatamoshCancellation) throws -> (UIImage, Double) {
         try cancellation.check()
         var complete = false
-        defer { if !complete { clear() } }
-        if previewURL != media.url || previewDocument != document || lastFrame + 1 != frame {
+        defer { if !complete { resetPreview() } }
+        if previewURL != media.url {
             clear()
-            let start = document.replayStart(for: frame)
+            previewRenderer = try media.renderer(preview: true)
+            previewURL = media.url
+        }
+        if previewDocument != document { previewImages.removeAll(); resetPreview(); previewDocument = document }
+        if let image = previewImages[frame] { complete = true; return image }
+        let replayStart = document.replayStart(for: frame)
+        if previewOutput == nil || frame <= lastFrame || replayStart > lastFrame + 1 || frame - lastFrame > 120 {
+            resetPreview()
             // Decode before the requested boundary: AVAssetReader may round a timeRange
             // start past the exact frame when the track uses a different time scale.
-            let (reader, output) = try media.reader(start: max(0, start - 2))
-            previewStart = start
+            let (reader, output) = try media.reader(start: max(0, replayStart - 2))
+            previewStart = replayStart
             previewReader = reader; previewOutput = output
-            let (w, h) = media.renderSize(preview: true)
-            previewRenderer = try DatamoshRenderer(width: w, height: h, referenceWidth: Int(media.size.width), transform: media.transform)
-            previewDocument = document; previewURL = media.url
         }
         guard let renderer = previewRenderer, let output = previewOutput else { throw TrenchesError.message("Превью недоступно.") }
         var trace = ["requested=\(frame), count=\(media.frameCount), replayStart=\(previewStart), last=\(lastFrame)",
@@ -148,19 +179,27 @@ final class DatamoshWorker: @unchecked Sendable {
             let index = media.decodedFrame(at: CMSampleBufferGetPresentationTimeStamp(sample))
             trace.append("decoded=\(index), pts=\(CMSampleBufferGetPresentationTimeStamp(sample).seconds), samples=\(CMSampleBufferGetNumSamples(sample)), image=\(CMSampleBufferGetImageBuffer(sample) != nil)")
             if trace.count > 24 { trace.remove(at: 3) }
-            if index < previewStart { continue }
+            if index < previewStart || index <= lastFrame { continue }
             guard let input = CMSampleBufferGetImageBuffer(sample) else { continue }
             guard index <= frame else { break }
-            let result = try autoreleasepool { try renderer.render(input, frame: index, document: document) }
+            let result = try autoreleasepool {
+                let donor = try media.donor(for: index, document: document, cancellation: cancellation)
+                return try renderer.render(input, frame: index, document: document, donor: donor)
+            }
+            lastFrame = index
             let id = document.segment(at: index)?.id
             if previewSegmentID != id { previewMovement = 0; previewSegmentID = id }
             previewMovement = max(previewMovement, renderer.movement)
             if index == frame {
-                lastFrame = index
                 let image = CIImage(cvPixelBuffer: result)
                 guard let cg = renderer.context.createCGImage(image, from: image.extent) else { throw TrenchesError.message("Не удалось показать кадр.") }
+                let snapshot = (UIImage(cgImage: cg), previewMovement)
+                if previewImages.count >= 12, let index = previewImages.keys.max(by: { abs($0 - frame) < abs($1 - frame) }) {
+                    previewImages.removeValue(forKey: index)
+                }
+                previewImages[frame] = snapshot
                 complete = true
-                return (UIImage(cgImage: cg), previewMovement)
+                return snapshot
             }
         }
         try cancellation.check()
@@ -175,11 +214,15 @@ final class DatamoshWorker: @unchecked Sendable {
     static func thumbnails(_ media: DatamoshMedia, cancellation: DatamoshCancellation) async throws -> [DatamoshThumbnail] {
         let generator = AVAssetImageGenerator(asset: media.asset)
         generator.appliesPreferredTrackTransform = true; generator.maximumSize = CGSize(width: 96, height: 144)
+        let tolerance = CMTime(value: 1, timescale: 60)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
         var result: [DatamoshThumbnail] = []
         for frame in stride(from: 0, to: media.frameCount, by: max(1, (media.frameCount + 79) / 80)) {
             try cancellation.check()
-            let resultImage = try await generator.image(at: media.times[frame])
-            result.append(DatamoshThumbnail(frame: frame, image: UIImage(cgImage: resultImage.image)))
+            if let resultImage = try? await generator.image(at: media.times[frame]) {
+                result.append(DatamoshThumbnail(frame: frame, image: UIImage(cgImage: resultImage.image)))
+            }
         }
         return result
     }
@@ -214,9 +257,15 @@ final class DatamoshWorker: @unchecked Sendable {
         return points
     }
 
-    func export(_ media: DatamoshMedia, document: DatamoshDocument, preview: Bool, cancellation: DatamoshCancellation, progress: @escaping (Double) -> Void) throws -> URL {
-        clear()
+    func export(_ media: DatamoshMedia, document: DatamoshDocument, preview: Bool, frames: Range<Int>? = nil,
+                cancellation: DatamoshCancellation, progress: @escaping (Double) -> Void) throws -> URL {
+        if !preview { clear() }
         let document = try document.validated(frameCount: media.frameCount)
+        let visible = frames ?? (0..<media.frameCount)
+        guard !visible.isEmpty, visible.lowerBound >= 0, visible.upperBound <= media.frameCount else { throw DatamoshEditError.invalidRange }
+        let startTime = media.times[visible.lowerBound]
+        let endTime = visible.upperBound < media.frameCount ? media.times[visible.upperBound] : media.duration
+        let decodeStart = document.replayStart(for: visible.lowerBound)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("datamosh-\(UUID().uuidString).mov")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         var success = false
@@ -235,34 +284,47 @@ final class DatamoshWorker: @unchecked Sendable {
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: media.audioFormat)
             guard writer.canAdd(input) else { throw TrenchesError.message("Невозможно скопировать исходную звуковую дорожку.") }
             writer.add(input); audio = input
-            let pair = try media.reader(audioOnly: true); audioReader = pair.0; audioOutput = pair.1
+            let range = frames.map { _ in CMTimeRange(start: startTime, end: endTime) }
+            let pair = try media.reader(audioOnly: true, timeRange: range); audioReader = pair.0; audioOutput = pair.1
         }
-        let (reader, output) = try media.reader()
+        let (reader, output) = try media.reader(start: max(0, decodeStart - 2))
         defer { reader.cancelReading(); audioReader?.cancelReading() }
-        let renderer = try DatamoshRenderer(width: w, height: h, referenceWidth: Int(media.size.width), transform: media.transform)
+        let renderer = try media.renderer(preview: preview)
         guard writer.startWriting() else { throw writer.error ?? TrenchesError.message("Не удалось начать экспорт.") }
-        writer.startSession(atSourceTime: media.times[0])
+        writer.startSession(atSourceTime: startTime)
         var videoSample = output.copyNextSampleBuffer(), audioSample = audioOutput?.copyNextSampleBuffer()
         var videoFinished = false, audioFinished = audio == nil, lastProgress = -1
+        var lastFrame = decodeStart - 1
         var lastWork = Date()
         while !videoFinished || !audioFinished {
             try cancellation.check()
             guard writer.status == .writing else { throw writer.error ?? TrenchesError.message("Экспорт прерван кодировщиком.") }
             var worked = false
             if let sample = videoSample, video.isReadyForMoreMediaData {
+                let time = CMSampleBufferGetPresentationTimeStamp(sample)
+                guard time.isNumeric, let buffer = CMSampleBufferGetImageBuffer(sample) else {
+                    videoSample = output.copyNextSampleBuffer()
+                    continue
+                }
+                let frame = media.decodedFrame(at: time)
+                if frame >= visible.upperBound { videoSample = nil; continue }
                 try autoreleasepool {
-                    let time = CMSampleBufferGetPresentationTimeStamp(sample)
-                    let frame = media.decodedFrame(at: time)
-                    guard let buffer = CMSampleBufferGetImageBuffer(sample) else { return }
-                    let result = try renderer.render(buffer, frame: frame, document: document)
+                    guard frame > lastFrame else { return }
+                    guard frame == lastFrame + 1 else { throw TrenchesError.message("Декодер пропустил кадр \(lastFrame + 2) при экспорте.") }
+                    let donor = try media.donor(for: frame, document: document, cancellation: cancellation)
+                    let result = try renderer.render(buffer, frame: frame, document: document, donor: donor)
+                    lastFrame = frame
+                    guard visible.contains(frame) else { return }
                     guard adaptor.append(result, withPresentationTime: time) else { throw writer.error ?? TrenchesError.message("Не удалось записать кадр Datamosh.") }
-                    let percent = (frame + 1) * 100 / media.frameCount
-                    if percent != lastProgress { lastProgress = percent; progress(Double(frame + 1) / Double(media.frameCount)) }
+                    let complete = Double(frame - visible.lowerBound + 1) / Double(visible.count)
+                    let percent = Int(complete * 100)
+                    if percent != lastProgress { lastProgress = percent; progress(complete) }
                 }
                 videoSample = output.copyNextSampleBuffer(); worked = true
             }
             if videoSample == nil, !videoFinished {
                 if let error = reader.error { throw error }
+                guard lastFrame == visible.upperBound - 1 else { throw TrenchesError.message("Декодер потерял часть кадров при экспорте.") }
                 video.markAsFinished(); videoFinished = true; worked = true
             }
             if let sample = audioSample, let audio, audio.isReadyForMoreMediaData {
@@ -279,7 +341,7 @@ final class DatamoshWorker: @unchecked Sendable {
                 Thread.sleep(forTimeInterval: 0.002)
             }
         }
-        writer.endSession(atSourceTime: media.duration)
+        writer.endSession(atSourceTime: endTime)
         let finished = DispatchSemaphore(value: 0)
         writer.finishWriting { finished.signal() }
         while finished.wait(timeout: .now() + 0.1) == .timedOut { try cancellation.check() }

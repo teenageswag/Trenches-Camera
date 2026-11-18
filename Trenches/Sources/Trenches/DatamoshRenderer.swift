@@ -19,11 +19,15 @@ final class DatamoshRenderer {
     private var previousFrame: Int?
     private var activeID: UUID?
     private var outputIndex = 0
-    private var velocityIndex = 0
+    private let analysisWidth: Int
+    private let analysisHeight: Int
+    private let referenceHeight: Int
+    private var analysisIndex = 0
+    private var runStart = 0
     private let activity: MTLBuffer
     private(set) var movement = 0.0
 
-    init(width: Int, height: Int, referenceWidth: Int, transform: CGAffineTransform = .identity) throws {
+    init(width: Int, height: Int, referenceWidth: Int, referenceHeight: Int? = nil, transform: CGAffineTransform = .identity) throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
               let activity = device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared),
               let url = Bundle.module.url(forResource: "Effects", withExtension: "metal", subdirectory: "Shaders") else {
@@ -31,10 +35,14 @@ final class DatamoshRenderer {
         }
         self.device = device; self.queue = queue; self.activity = activity
         self.width = width; self.height = height; self.referenceWidth = referenceWidth; self.transform = transform
+        self.referenceHeight = referenceHeight ?? max(1, Int((Double(height) * Double(referenceWidth) / Double(width)).rounded()))
+        let analysisScale = min(1, 640.0 / Double(max(referenceWidth, self.referenceHeight)))
+        analysisWidth = max(2, Int((Double(referenceWidth) * analysisScale).rounded()))
+        analysisHeight = max(2, Int((Double(self.referenceHeight) * analysisScale).rounded()))
         context = CIContext(mtlDevice: device, options: [.cacheIntermediates: false])
         let library = try device.makeLibrary(source: String(contentsOf: url, encoding: .utf8), options: nil)
         var pipelines: [String: MTLComputePipelineState] = [:]
-        for name in ["estimateMotion", "opticalFlow", "accumulateVectors", "datamoshCompose", "copyFrame", "motionActivity"] {
+        for name in ["estimateMotion", "opticalFlow", "flowToBlocks", "datamoshResidual", "datamoshDecode", "copyFrame", "motionActivity"] {
             guard let function = library.makeFunction(name: name) else { throw TrenchesError.message("Не найден шейдер \(name).") }
             pipelines[name] = try device.makeComputePipelineState(function: function)
         }
@@ -70,90 +78,127 @@ final class DatamoshRenderer {
         try encode(command, "copyFrame", [source, target])
     }
 
-    func render(_ buffer: CVPixelBuffer, frame: Int, document: DatamoshDocument) throws -> CVPixelBuffer {
-        guard let command = queue.makeCommandBuffer() else { throw TrenchesError.message("Очередь Datamosh недоступна.") }
-        let current = try texture("current", width, height)
-        let previous = try texture("previous", width, height)
-        let anchor = try texture("anchor", width, height)
+    func reset() {
+        previousFrame = nil
+        activeID = nil
+        movement = 0
+    }
+
+    private func draw(_ buffer: CVPixelBuffer, into texture: MTLTexture, using command: MTLCommandBuffer) throws {
         var image = CIImage(cvPixelBuffer: buffer).transformed(by: transform)
         image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
-        image = image.transformed(by: CGAffineTransform(scaleX: CGFloat(width) / image.extent.width, y: CGFloat(height) / image.extent.height))
-        let destination = CIRenderDestination(mtlTexture: current, commandBuffer: command)
-        destination.isFlipped = true; destination.colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
-        _ = try context.startTask(toRender: image, from: CGRect(x: 0, y: 0, width: width, height: height), to: destination, at: .zero)
-        let segment = document.segment(at: frame)
+        image = image.transformed(by: CGAffineTransform(scaleX: CGFloat(texture.width) / image.extent.width, y: CGFloat(texture.height) / image.extent.height))
+        let destination = CIRenderDestination(mtlTexture: texture, commandBuffer: command)
+        destination.isFlipped = true
+        destination.colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+        _ = try context.startTask(toRender: image, from: CGRect(x: 0, y: 0, width: texture.width, height: texture.height), to: destination, at: .zero)
+    }
+
+    func render(_ buffer: CVPixelBuffer, frame: Int, document: DatamoshDocument, donor: CVPixelBuffer? = nil) throws -> CVPixelBuffer {
+        guard let command = queue.makeCommandBuffer() else { throw TrenchesError.message("Очередь Datamosh недоступна.") }
+        let current = try texture("current", width, height)
+        try draw(buffer, into: current, using: command)
+        let segment = document.segment(at: frame).flatMap { $0.value("strength") > 0 ? $0 : nil }
         let consecutive = previousFrame.map { $0 + 1 == frame } ?? false
         let intervalReset = segment.map { $0.resetInterval > 0 && (frame - $0.start) % $0.resetInterval == 0 } ?? false
         let reset = !consecutive || segment?.id != activeID || intervalReset || document.resets.contains(frame)
-        let oldOutput = try texture("output\(outputIndex)", width, height)
-        let output = try texture("output\(1 - outputIndex)", width, height)
+
+        var output = current
         movement = 0
-        if let segment, !reset {
-            let field: MTLTexture
-            let vectorScale: Float
-            if segment.value("estimation") < 0.5 {
-                let block = max(1, Float(segment.blockSize) * Float(width) / Float(referenceWidth))
-                field = try texture("blockFlow", Int(ceil(Float(width) / block)), Int(ceil(Float(height) / block)), .rgba16Float)
-                let search = max(1, 16 * Float(width) / Float(referenceWidth))
-                try encode(command, "estimateMotion", [current, previous, field], [SIMD4(block, search, 0, 0)])
-                vectorScale = 1
+        var fieldCount = 0
+        if let segment {
+            let history = try texture("output\(outputIndex)", width, height)
+            output = try texture("output\(1 - outputIndex)", width, height)
+            let currentAnalysis = try texture("analysis\(analysisIndex)", analysisWidth, analysisHeight)
+            try draw(buffer, into: currentAnalysis, using: command)
+            let anchor = segment.mode == .freeze ? try texture("anchor", width, height) : history
+            if reset {
+                runStart = frame
+                if frame == segment.start, segment.mode == .transfer, !document.resets.contains(frame) {
+                    if let donor { try draw(donor, into: output, using: command) }
+                    else if consecutive {
+                        try copy(command, texture("transferDonor", width, height), output)
+                    } else { try copy(command, current, output) }
+                } else {
+                    try copy(command, current, output)
+                }
+                if segment.mode == .freeze { try copy(command, current, anchor) }
             } else {
-                field = try opticalFlow(command, current, previous)
-                vectorScale = Float(width) / Float(field.width)
+                let block = segment.blockSize
+                let field = try texture("blockFlow", (referenceWidth + block - 1) / block,
+                                        (referenceHeight + block - 1) / block, .rgba16Float)
+                let residual = try texture("residual", analysisWidth, analysisHeight, .rgba16Float)
+                let age = frame - runStart
+                let period = max(2, Int(segment.value("repeat").rounded()))
+                let repeatAge = segment.mode == .bloom ? (age - 1) % period : 0
+                if repeatAge == 0 {
+                    let previousAnalysis = try texture("analysis\(1 - analysisIndex)", analysisWidth, analysisHeight)
+                    if segment.value("estimation") >= 0.5 {
+                        let flow = try opticalFlow(command, currentAnalysis, previousAnalysis)
+                        try encode(command, "flowToBlocks", [currentAnalysis, previousAnalysis, flow, field])
+                    } else {
+                        let search = max(4, 16 * Float(max(analysisWidth, analysisHeight)) / 640)
+                        try encode(command, "estimateMotion", [currentAnalysis, previousAnalysis, field], [SIMD4(search, 0, 0, 0)])
+                    }
+                    try encode(command, "datamoshResidual", [currentAnalysis, previousAnalysis, field, residual], [SIMD4(segment.value("strength"), 0, 0, 0)])
+                }
+                let recovery = segment.recoveryFrames
+                let remaining = segment.endFrame - frame
+                let repair = recovery > 0 ? max(0, Float(recovery - remaining + 1) / Float(recovery + 1)) : 0
+                let settings = [
+                    SIMD4(Float(segment.mode.index), segment.value("strength"), Float(age), segment.value("seed").rounded()),
+                    SIMD4(segment.value("accumulation"), segment.value("decay"), segment.value("threshold"), segment.value("fraction")),
+                    SIMD4(segment.value("distortion"), segment.value("distortionAmount"), segment.value("trail").rounded(), 0),
+                    SIMD4(repair, Float(repeatAge), 0, 0)
+                ]
+                try encode(command, "datamoshDecode", [current, history, anchor, field, residual, output], settings)
+                activity.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+                try encode(command, "motionActivity", [field], buffer: activity)
+                fieldCount = field.width * field.height
             }
-            let velocity = try texture("velocity\(velocityIndex)", field.width, field.height, .rgba16Float)
-            let nextVelocity = try texture("velocity\(1 - velocityIndex)", field.width, field.height, .rgba16Float)
-            let velocityValid = previousFrame != nil && activeID == segment.id && textures["velocityValid"] != nil
-            try encode(command, "accumulateVectors", [field, velocity, nextVelocity], [SIMD4(segment.value("accumulation"), segment.value("decay"), velocityValid ? 1 : 0, 0)])
-            textures["velocityValid"] = nextVelocity
-            velocityIndex = 1 - velocityIndex
-            var p = [SIMD4<Float>](repeating: .zero, count: 4)
-            p[0] = SIMD4(Float(segment.mode.index), segment.value("strength"), Float(segment.blockSize) * Float(width) / Float(referenceWidth), Float(frame))
-            p[1] = SIMD4(segment.value("accumulation"), segment.value("decay"), segment.value("threshold"), segment.value("fraction"))
-            p[2] = SIMD4(segment.value("distortion"), segment.value("distortionAmount"), segment.value("trail"), segment.value("seed").rounded())
-            p[3] = SIMD4(vectorScale, Float(width) / Float(referenceWidth), 0, 0)
-            try encode(command, "datamoshCompose", [current, previous, oldOutput, anchor, field, nextVelocity, output], p)
-            activity.contents().storeBytes(of: UInt32(0), as: UInt32.self)
-            try encode(command, "motionActivity", [field], [SIMD4(vectorScale, 0, 0, 0)], buffer: activity)
-            movement = -Double(field.width * field.height)
-        } else {
-            // Transfer seeds from scene A; other modes start from the current unmodified frame.
-            let initial = segment?.mode == .transfer && frame == segment?.start && (segment?.value("strength") ?? 0) > 0 && consecutive ? previous : current
-            try copy(command, initial, output)
-            try copy(command, current, anchor)
-            textures.removeValue(forKey: "velocityValid")
+            analysisIndex = 1 - analysisIndex
+            outputIndex = 1 - outputIndex
         }
-        try copy(command, current, previous)
+        // Preserve the original frame before a cut, even when two ranges touch.
+        if let next = document.segment(at: frame + 1), next.start == frame + 1, next.mode == .transfer, next.donorFrame == nil {
+            try copy(command, current, texture("transferDonor", width, height))
+        }
+
         var result: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &result) == kCVReturnSuccess, let result else { throw TrenchesError.message("Недостаточно памяти для выходного кадра.") }
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &result) == kCVReturnSuccess, let result else {
+            throw TrenchesError.message("Недостаточно памяти для выходного кадра.")
+        }
         var reference: CVMetalTexture?
         guard CVMetalTextureCacheCreateTextureFromImage(nil, cache, result, nil, .bgra8Unorm, width, height, 0, &reference) == kCVReturnSuccess,
-              let reference, let target = CVMetalTextureGetTexture(reference) else { throw TrenchesError.message("Не удалось создать выходную текстуру Datamosh.") }
+              let reference, let target = CVMetalTextureGetTexture(reference) else {
+            throw TrenchesError.message("Не удалось создать выходную текстуру Datamosh.")
+        }
         try copy(command, output, target)
-        command.commit(); command.waitUntilCompleted()
-        withExtendedLifetime([reference as Any, image as Any]) {}
+        command.commit()
+        command.waitUntilCompleted()
+        withExtendedLifetime((buffer, donor, reference)) {}
         if let error = command.error { throw error }
-        if movement < 0 { movement = Double(activity.contents().load(as: UInt32.self)) / -movement }
-        previousFrame = frame; activeID = segment?.id; outputIndex = 1 - outputIndex
+        if fieldCount > 0 { movement = Double(activity.contents().load(as: UInt32.self)) / Double(fieldCount) }
+        previousFrame = frame
+        activeID = segment?.id
         return result
     }
 
     private func opticalFlow(_ command: MTLCommandBuffer, _ current: MTLTexture, _ previous: MTLTexture) throws -> MTLTexture {
-        let scale = min(1, 960.0 / Double(max(width, height)))
-        let w = max(8, Int(Double(width) * scale)), h = max(8, Int(Double(height) * scale))
         let scaler = MPSImageBilinearScale(device: device)
         var currents: [MTLTexture] = [], previouses: [MTLTexture] = []
-        for level in 0..<4 {
-            let cw = max(4, w >> level), ch = max(4, h >> level)
-            let a = try texture("opticalCurrent\(level)", cw, ch)
-            let b = try texture("opticalPrevious\(level)", cw, ch)
+        for level in 1...3 {
+            let w = max(2, analysisWidth >> level), h = max(2, analysisHeight >> level)
+            let a = try texture("opticalCurrent\(level)", w, h)
+            let b = try texture("opticalPrevious\(level)", w, h)
             scaler.encode(commandBuffer: command, sourceTexture: currents.last ?? current, destinationTexture: a)
             scaler.encode(commandBuffer: command, sourceTexture: previouses.last ?? previous, destinationTexture: b)
-            currents.append(a); previouses.append(b)
+            currents.append(a)
+            previouses.append(b)
         }
         var flow: MTLTexture?
-        for level in (0..<4).reversed() {
-            for iteration in 0..<4 {
+        for level in currents.indices.reversed() {
+            for iteration in 0..<3 {
                 let target = try texture("opticalFlow\(level)-\(iteration % 2)", currents[level].width, currents[level].height, .rgba16Float)
                 try encode(command, "opticalFlow", [currents[level], previouses[level], flow ?? previouses[level], target], [SIMD4(flow == nil ? 0 : 1, 0, 0, 0)])
                 flow = target

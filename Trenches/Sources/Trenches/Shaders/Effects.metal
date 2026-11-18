@@ -75,61 +75,64 @@ kernel void macroblockCorrupt(texture2d<float, access::sample> source [[texture(
     target.write(source.sample(glyphSampler, (float2(gid) + 0.5 + offset) / size), gid);
 }
 
-float motionCost(texture2d<float, access::sample> current, texture2d<float, access::sample> previous,
-                 float2 origin, float2 offset, float block) {
-    float2 size = float2(current.get_width(), current.get_height());
-    float cost = 0;
-    for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) {
-        float2 point = origin + (float2(x, y) + 0.5) * block / 4.0;
-        cost += abs(luminance(current.sample(linearSampler, point / size).rgb) -
-                    luminance(previous.sample(linearSampler, (point + offset) / size).rgb));
-    }
-    return cost / 16.0;
+float2 datamoshBlock(float2 uv, float2 grid) {
+    return (floor(uv * grid) + 0.5) / grid;
 }
 
-// Backward vectors: a current pixel samples the previous frame at pixel + vector.
-// The zero-vector preference and noise floor prevent sensor noise from smearing a tripod shot.
+float motionCost(texture2d<float, access::sample> current, texture2d<float, access::sample> previous,
+                 float2 origin, float2 offset, float2 block) {
+    float2 pixel = 1.0 / float2(current.get_width(), current.get_height());
+    float cost = 0;
+    for (int y = 0; y < 3; ++y) for (int x = 0; x < 3; ++x) {
+        float2 uv = origin + (float2(x, y) + 0.5) * block / 3.0;
+        cost += abs(luminance(current.sample(linearSampler, uv).rgb) -
+                    luminance(previous.sample(linearSampler, uv + offset * pixel).rgb));
+    }
+    return cost / 9.0;
+}
+
+// Store one backward prediction vector per block in normalized image coordinates.
 kernel void estimateMotion(texture2d<float, access::sample> current [[texture(0)]],
                            texture2d<float, access::sample> previous [[texture(1)]],
                            texture2d<float, access::write> field [[texture(2)]],
                            constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= field.get_width() || gid.y >= field.get_height()) return;
-    float block = p[0].x;
+    float2 grid = float2(field.get_width(), field.get_height());
+    float2 block = 1.0 / grid;
     float2 origin = float2(gid) * block;
     float stationary = motionCost(current, previous, origin, float2(0), block);
     float best = stationary;
     float2 vector = float2(0);
-    for (int stepSize = int(p[0].y); stepSize >= 1; stepSize /= 2) {
-        float2 center = vector;
-        for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
-            float2 candidate = center + float2(x, y) * stepSize;
-            float cost = motionCost(current, previous, origin, candidate, block) + length(candidate) * 0.0004;
-            if (cost < best) { best = cost; vector = candidate; }
+    if (stationary > 0.006) {
+        for (int stepSize = int(p[0].x); stepSize >= 1; stepSize /= 2) {
+            float2 center = vector;
+            for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+                if (x == 0 && y == 0) continue;
+                float2 candidate = center + float2(x, y) * stepSize;
+                float cost = motionCost(current, previous, origin, candidate, block) + length(candidate) * 0.00035;
+                if (cost < best) { best = cost; vector = candidate; }
+            }
         }
     }
-    float confidence = smoothstep(0.008, 0.035, stationary - best);
-    field.write(float4(vector * confidence, stationary, confidence), gid);
+    if (stationary - best < 0.004) vector = float2(0);
+    field.write(float4(vector / float2(current.get_width(), current.get_height()), stationary, 0), gid);
 }
 
 kernel void copyFrame(texture2d<float, access::sample> source [[texture(0)]],
                       texture2d<float, access::write> target [[texture(1)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
-    target.write(source.sample(linearSampler, (float2(gid) + 0.5) / float2(target.get_width(), target.get_height())), gid);
+    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
+    target.write(source.sample(glyphSampler, uv), gid);
 }
 
-// Coarse-to-fine iterative Lucas-Kanade. Each pass warps the previous image and solves
-// the local brightness-constancy system; regularization rejects flat/noisy regions.
+// Coarse-to-fine iterative Lucas-Kanade on the canonical analysis image.
 kernel void opticalFlow(texture2d<float, access::sample> current [[texture(0)]],
                         texture2d<float, access::sample> previous [[texture(1)]],
                         texture2d<float, access::sample> coarse [[texture(2)]],
                         texture2d<float, access::write> target [[texture(3)]],
                         constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
     float2 size = float2(target.get_width(), target.get_height());
     float2 uv = (float2(gid) + 0.5) / size;
     float2 vector = p[0].x > 0.5 ? coarse.sample(linearSampler, uv).xy * size / float2(coarse.get_width(), coarse.get_height()) : float2(0);
     float xx = 0.001, yy = 0.001, xy = 0, xt = 0, yt = 0;
-    float residual = 0;
     for (int y = -2; y <= 2; ++y) for (int x = -2; x <= 2; ++x) {
         float2 point = uv + float2(x, y) / size;
         float2 warped = point + vector / size;
@@ -139,87 +142,107 @@ kernel void opticalFlow(texture2d<float, access::sample> current [[texture(0)]],
                     luminance(previous.sample(linearSampler, warped - float2(0, 1.0 / size.y)).rgb)) * 0.5;
         float dt = luminance(previous.sample(linearSampler, warped).rgb) - luminance(current.sample(linearSampler, point).rgb);
         xx += dx * dx; yy += dy * dy; xy += dx * dy; xt += dx * dt; yt += dy * dt;
-        residual += abs(dt);
     }
-    float determinant = xx * yy - xy * xy;
-    float2 update = float2(xy * yt - yy * xt, xy * xt - xx * yt) / max(determinant, 0.000001);
-    vector += clamp(update, -3.0, 3.0);
-    float difference = abs(luminance(current.sample(linearSampler, uv).rgb) - luminance(previous.sample(linearSampler, uv).rgb));
-    float confidence = smoothstep(0.003, 0.02, difference);
-    vector *= confidence;
-    target.write(float4(clamp(vector, -96.0, 96.0), residual / 25.0, confidence), gid);
+    float2 update = float2(xy * yt - yy * xt, xy * xt - xx * yt) / max(xx * yy - xy * xy, 0.000001);
+    target.write(float4(clamp(vector + clamp(update, -3.0, 3.0), -64.0, 64.0), 0, 0), gid);
 }
 
-kernel void accumulateVectors(texture2d<float, access::sample> field [[texture(0)]],
-                              texture2d<float, access::sample> previous [[texture(1)]],
-                              texture2d<float, access::write> target [[texture(2)]],
-                              constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
-    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
-    float2 history = p[0].z > 0.5 ? previous.sample(linearSampler, uv).xy : float2(0);
-    float2 velocity = history * p[0].y + field.sample(linearSampler, uv).xy * p[0].x;
-    target.write(float4(clamp(velocity, -128.0, 128.0), 0, 1), gid);
+kernel void flowToBlocks(texture2d<float, access::sample> current [[texture(0)]],
+                         texture2d<float, access::sample> previous [[texture(1)]],
+                         texture2d<float, access::sample> flow [[texture(2)]],
+                         texture2d<float, access::write> target [[texture(3)]], uint2 gid [[thread_position_in_grid]]) {
+    float2 block = 1.0 / float2(target.get_width(), target.get_height());
+    float2 origin = float2(gid) * block;
+    float2 uv = origin + block * 0.5;
+    float difference = motionCost(current, previous, origin, float2(0), block);
+    float2 vector = round(flow.sample(linearSampler, uv).xy) / float2(flow.get_width(), flow.get_height());
+    target.write(float4(difference > 0.008 ? vector : float2(0), difference, 0), gid);
 }
 
 kernel void motionActivity(texture2d<float, access::read> field [[texture(0)]],
-                           constant float4 *p [[buffer(0)]], device atomic_uint *activity [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= field.get_width() || gid.y >= field.get_height()) return;
-    if (length(field.read(gid).xy) * p[0].x > 0.5) atomic_fetch_add_explicit(activity, 1u, memory_order_relaxed);
+                           device atomic_uint *activity [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (field.read(gid).z > 0.017) atomic_fetch_add_explicit(activity, 1u, memory_order_relaxed);
 }
 
-kernel void datamoshCompose(texture2d<float, access::sample> current [[texture(0)]],
-                            texture2d<float, access::sample> previous [[texture(1)]],
-                            texture2d<float, access::sample> history [[texture(2)]],
-                            texture2d<float, access::sample> anchor [[texture(3)]],
-                            texture2d<float, access::sample> field [[texture(4)]],
-                            texture2d<float, access::sample> accumulated [[texture(5)]],
-                            texture2d<float, access::write> target [[texture(6)]],
-                            constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
-    float2 size = float2(target.get_width(), target.get_height());
-    float2 uv = (float2(gid) + 0.5) / size;
+// Prediction instructions are made against the CLEAN reference. Using the damaged
+// reference here would immediately compensate for the glitch on the next frame.
+kernel void datamoshResidual(texture2d<float, access::sample> current [[texture(0)]],
+                             texture2d<float, access::sample> previous [[texture(1)]],
+                             texture2d<float, access::sample> field [[texture(2)]],
+                             texture2d<float, access::write> target [[texture(3)]],
+                             constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
+    float2 grid = float2(field.get_width(), field.get_height());
+    float3 delta = current.sample(glyphSampler, uv).rgb -
+                   previous.sample(glyphSampler, uv + field.sample(glyphSampler, datamoshBlock(uv, grid)).xy).rgb;
+    float y = luminance(delta);
+    float3 residual = float3(y, delta.b - y, delta.r - y);
+    float3 quantum = mix(0.024, 0.13, p[0].x) * float3(1.0, 1.8, 1.8);
+    residual = clamp(round(residual / quantum) * quantum, -0.34, 0.34);
+    target.write(float4(residual, 0), gid);
+}
+
+kernel void datamoshDecode(texture2d<float, access::sample> current [[texture(0)]],
+                           texture2d<float, access::sample> history [[texture(1)]],
+                           texture2d<float, access::sample> anchor [[texture(2)]],
+                           texture2d<float, access::sample> field [[texture(3)]],
+                           texture2d<float, access::sample> residual [[texture(4)]],
+                           texture2d<float, access::write> target [[texture(5)]],
+                           constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
+    float2 grid = float2(field.get_width(), field.get_height());
+    uint2 block = uint2(uv * grid);
     int mode = int(p[0].x);
     float strength = p[0].y;
-    float3 source = current.sample(linearSampler, uv).rgb;
-    float2 vector = field.sample(linearSampler, uv).xy * p[3].x;
-    uint hash = blockHash(uint2(floor(float2(gid) / max(p[0].z, 0.1))), uint(p[0].w), uint(p[2].w));
-    if (mode == 1) vector = accumulated.sample(linearSampler, uv).xy * p[3].x;
-    if (mode == 5) {
-        int kind = int(p[2].x);
-        float amount = p[2].y;
-        if (kind == 0) vector *= -amount;
-        else if (kind == 1) vector *= 1.0 + amount * 3.0;
-        else if (kind == 2) {
-            float angle = amount * M_PI_F * 0.5;
-            vector = float2(vector.x * cos(angle) - vector.y * sin(angle), vector.x * sin(angle) + vector.y * cos(angle));
-        } else vector += corruptedBlockOffset(hash, amount * 24.0 * p[3].y, max(p[0].z, 0.1));
-    }
-    vector *= strength;
-    float2 warpedUV = uv + vector / size;
-    float3 warped = history.sample(linearSampler, warpedUV).rgb;
-    float3 output = source;
+    uint age = uint(p[0].z);
+    uint seed = uint(p[0].w);
+    float4 motion = field.sample(glyphSampler, datamoshBlock(uv, grid));
+    float2 vector = motion.xy;
+    uint hash = blockHash(block, 0, seed);
+    float random = blockRandom(hash);
+    bool repair = random < p[3].x;
+    float3 output;
     if (mode == 2) {
-        float difference = length(source - previous.sample(linearSampler, uv).rgb) / sqrt(3.0);
-        float moving = smoothstep(p[1].z, p[1].z * 1.5 + 0.001, difference);
-        output = mix(anchor.sample(linearSampler, uv).rgb, source, moving);
-        output = mix(source, output, strength);
+        bool update = random > strength || motion.z >= p[1].z;
+        output = repair || update ? current.sample(glyphSampler, uv).rgb : anchor.sample(glyphSampler, uv).rgb;
     } else if (mode == 4) {
-        if (blockRandom(hash) < p[1].w) {
-            float2 offset = corruptedBlockOffset(hash, 96.0 * p[3].y, max(p[0].z, 0.1)) / size;
-            float3 corrupt = blockRandom(hash * 1664525u) < 0.5 ? history.sample(linearSampler, uv).rgb : anchor.sample(linearSampler, uv + offset).rgb;
-            output = mix(source, corrupt, strength);
-        }
+        uint packet = blockHash(block, age / 8, seed);
+        bool damaged = random < p[1].w * strength;
+        float2 offset = corruptedBlockOffset(packet, 3.0, 1.0) / grid;
+        if (repair || !damaged) output = current.sample(glyphSampler, uv).rgb;
+        else if (blockRandom(packet * 1664525u) < 0.65) output = history.sample(glyphSampler, uv).rgb;
+        else output = history.sample(glyphSampler, uv + offset).rgb;
     } else if (mode == 6) {
-        // Recursive exponential history: trail controls the effective decay length in frames.
-        float feedback = pow(max(p[1].y, 0.001), 1.0 / max(p[2].z, 1.0)) * strength;
-        output = mix(source, history.sample(linearSampler, uv).rgb, min(feedback, 0.995));
+        uint period = max(2u, uint(p[2].z));
+        uint hold = uint(round(float(period) * p[1].y * strength));
+        bool update = (age + hash % period) % period >= hold;
+        output = repair || update ? current.sample(glyphSampler, uv).rgb : history.sample(glyphSampler, uv).rgb;
     } else {
-        float3 residual = source - previous.sample(linearSampler, warpedUV).rgb;
-        float retention = mix(0.0, 0.995, strength);
-        if (mode == 3 || mode == 1) retention = strength;
-        output = mix(source, warped + residual * (1.0 - strength), retention);
+        if (mode == 1) vector *= 1.0 + p[1].x * p[3].y * pow(p[1].y, p[3].y);
+        if (mode == 5) {
+            int kind = int(p[2].x);
+            float amount = p[2].y;
+            if (kind == 0) vector *= -amount;
+            else if (kind == 1) vector *= 1.0 + amount * 3.0;
+            else if (kind == 2) {
+                float angle = amount * M_PI_F * 0.5;
+                vector = float2(vector.x * cos(angle) - vector.y * sin(angle), vector.x * sin(angle) + vector.y * cos(angle));
+            } else {
+                uint packet = blockHash(block, age / 4, seed);
+                vector += corruptedBlockOffset(packet, amount * 2.0, 1.0) / grid;
+            }
+        }
+        // Hard intra refresh, inter prediction, or retain the wrong reference.
+        bool intra = random > 0.32 + 0.68 * strength;
+        if (repair || intra) output = current.sample(glyphSampler, uv).rgb;
+        else if (motion.z < 0.007 && mode != 5) output = history.sample(glyphSampler, uv).rgb;
+        else {
+            float3 coded = residual.sample(glyphSampler, uv).rgb;
+            float3 delta = float3(coded.x + coded.z, coded.x - (0.0722 * coded.y + 0.2126 * coded.z) / 0.7152, coded.x + coded.y);
+            output = history.sample(glyphSampler, uv + vector).rgb + delta * (1.0 - 0.76 * strength);
+        }
     }
-    target.write(float4(clamp(output, 0.0, 1.0), 1), gid);
+    target.write(float4(clamp(output, 0.0, 1.0), 1.0), gid);
 }
 
 kernel void grade(texture2d<float, access::sample> source [[texture(0)]],

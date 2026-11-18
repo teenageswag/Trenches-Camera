@@ -53,12 +53,22 @@ struct SettingsChecks {
         segment.mode = .transfer; try document.put(segment, frameCount: 100)
         precondition(document.replayStart(for: 19) == 18)
         precondition(document.replayStart(for: 11) == 9)
+        let legacy = try JSONDecoder().decode(DatamoshDocument.self, from: JSONEncoder().encode(document))
+        precondition(legacy.segments[0].donorFrame == nil && legacy.segments[0].recoveryFrames == 0)
+        segment.donorFrame = 100
+        do { try document.put(segment, frameCount: 100); preconditionFailure("Accepted donor outside clip") }
+        catch DatamoshEditError.invalidRange { precondition(document == legacy) }
+        segment.donorFrame = 81
+        segment.values["recovery"] = 90
+        try document.put(segment, frameCount: 100)
+        precondition(document.replayStart(for: 11) == 10 && segment.recoveryFrames == 19)
         var history = DatamoshHistory()
         history.record(before)
         precondition(history.undo(document) == before && history.redo(before) == document)
         let preset = DatamoshPreset(name: "Test", frameCount: 100, document: document)
         let scaled = try preset.applied(to: 200)
         precondition(scaled.segments[0].start == 20 && scaled.segments[0].duration == 40 && scaled.resets == [36])
+        precondition(scaled.segments[0].donorFrame == 162)
         let decoded = try JSONDecoder().decode(DatamoshDocument.self, from: JSONEncoder().encode(document))
         precondition(decoded == document)
         for mode in DatamoshMode.allCases {
@@ -73,6 +83,6 @@ struct SettingsChecks {
         }
         let cancellation = DatamoshCancellation(); cancellation.cancel()
         do { try cancellation.check(); preconditionFailure("Ignored cancellation") } catch is CancellationError { }
-        print("PASS: Datamosh non-overlap, boundaries, overflow, reset replay, transfer preroll, undo/redo, presets, JSON, mode parameter bounds, cancellation")
+        print("PASS: Datamosh ranges, boundaries, donor frames, recovery, reset replay, undo/redo, presets, JSON, parameter bounds, cancellation")
     }
 }
