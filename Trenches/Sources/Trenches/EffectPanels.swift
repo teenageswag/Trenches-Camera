@@ -57,6 +57,17 @@ struct EffectEditor: View {
                     ForEach(effect.parameters.filter(visible)) { parameter in
                         parameterControl(parameter)
                     }
+                    if effect == .motion, model.status.running {
+                        if model.status.shutterNeedsCameraSwitch, model.status.recording, model.settings.shutterAngle > 0 {
+                            Text("Выдержка включится после остановки записи.").foregroundStyle(.secondary)
+                        } else if !model.status.shutterSupported, !model.status.shutterNeedsCameraSwitch {
+                            Text("Эта камера не поддерживает ручную выдержку.").foregroundStyle(.secondary)
+                        } else if let duration = model.status.shutterDuration, duration.isFinite, duration > 0 {
+                            LabeledContent("Фактическая выдержка", value: "1/\(Int((1 / duration).rounded())) с")
+                        } else if model.settings.shutterAngle == 0 {
+                            LabeledContent("Выдержка", value: "Авто")
+                        }
+                    }
                 }
                 if effect == .ascii {
                     Section("Цвета ASCII") {

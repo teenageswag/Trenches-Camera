@@ -21,6 +21,9 @@ struct CameraStatus {
     var minZoom = 1.0
     var maxZoom = 10.0
     var zoomStops: [Double] = [1, 2]
+    var shutterSupported = false
+    var shutterDuration: Double?
+    var shutterNeedsCameraSwitch = false
 }
 
 final class CameraService: NSObject, @unchecked Sendable {
@@ -41,6 +44,9 @@ final class CameraService: NSObject, @unchecked Sendable {
     private var renderer: FrameRenderer?
     private var recorder: MovieRecorder?
     private let audioDegrader = AudioDegrader()
+    private let shutter = CameraShutter()
+    private var failedShutterAngle: Float?
+    private var shutterUsesPhysicalCamera = false
     private var settings = EffectSettings()
     private var status = CameraStatus()
     private var observers: [NSObjectProtocol] = []
@@ -84,9 +90,10 @@ final class CameraService: NSObject, @unchecked Sendable {
             do {
                 if renderErrorReported { renderer = nil; renderErrorReported = false }
                 if renderer == nil { renderer = try FrameRenderer() }
-                if session == nil || status.audio != (AVCaptureDevice.authorizationStatus(for: .audio) == .authorized) { try configure(lens: status.lens, quality: status.quality, wantsDepth: settings.wantsDepth) }
+                if session == nil || shutterRequiresReconfiguration || status.audio != (AVCaptureDevice.authorizationStatus(for: .audio) == .authorized) { try configure(lens: status.lens, quality: status.quality, wantsDepth: settings.wantsDepth) }
                 session?.startRunning()
                 status.running = session?.isRunning == true
+                refreshShutter()
                 publish()
             } catch { fail(error) }
         }
@@ -96,8 +103,8 @@ final class CameraService: NSObject, @unchecked Sendable {
         queue.async { [self] in
             desiredRunning = false
             if recorder != nil { stopRecordingOwned() }
+            if let device { try? shutter.restore(on: device) }
             session?.stopRunning()
-            renderer?.resetMotion()
             renderer = nil
             preview.clear()
             status.running = false
@@ -109,11 +116,15 @@ final class CameraService: NSObject, @unchecked Sendable {
         queue.async { [self] in
             let changedDepth = settings.wantsDepth != newSettings.wantsDepth
             if changedDepth && (status.recording || status.finishing || status.photoBusy) { return }
-            if settings.enabled(.motion) != newSettings.enabled(.motion) { renderer?.resetMotion() }
+            let changedShutter = settings.shutterAngle != newSettings.shutterAngle
+            if changedShutter { failedShutterAngle = nil }
             settings = newSettings
-            if changedDepth, session != nil {
+            if changedDepth || (changedShutter && shutterRequiresReconfiguration), session != nil {
                 do { try configure(lens: status.lens, quality: status.quality, wantsDepth: settings.wantsDepth) }
                 catch { fail(error) }
+            } else if changedShutter {
+                refreshShutter()
+                publish()
             }
         }
     }
@@ -131,7 +142,11 @@ final class CameraService: NSObject, @unchecked Sendable {
             (AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back) ??
              AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) ??
              AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back)) : nil
-        guard let camera = virtual ?? Self.captureDevice(lens, depth: wantsDepth) else { throw TrenchesError.message("Эта камера недоступна.") }
+        let needsPhysical = settings.shutterAngle > 0 && virtual?.isExposureModeSupported(.custom) == false
+        // Rear virtual cameras may only support auto exposure. Switch inputs between recordings.
+        guard let camera = (needsPhysical ? nil : virtual) ?? Self.captureDevice(lens, depth: wantsDepth) else {
+            throw TrenchesError.message("Эта камера недоступна.")
+        }
         let formats = camera.formats.filter {
             let dimensions = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
             return dimensions.width == quality.width && dimensions.height == quality.height && $0.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= Double(quality.fps) && $0.minFrameRate <= Double(quality.fps) }
@@ -142,6 +157,7 @@ final class CameraService: NSObject, @unchecked Sendable {
         }
         let previousSession = session
         previousSession?.stopRunning()
+        if let device { try? shutter.restore(on: device) }
         let newSession = AVCaptureSession()
         newSession.beginConfiguration()
         do {
@@ -202,6 +218,9 @@ final class CameraService: NSObject, @unchecked Sendable {
             newSession.commitConfiguration()
             observers.forEach(NotificationCenter.default.removeObserver)
             observers.removeAll()
+            shutter.reset()
+            failedShutterAngle = nil
+            shutterUsesPhysicalCamera = needsPhysical
             session = newSession; device = camera
             status.minZoom = Double(camera.minAvailableVideoZoomFactor) * multiplier
             status.maxZoom = min(25, Double(camera.maxAvailableVideoZoomFactor) * multiplier)
@@ -216,7 +235,6 @@ final class CameraService: NSObject, @unchecked Sendable {
                 }
             }
             sessionGeneration &+= 1
-            renderer?.resetMotion()
             preview.clear()
             fpsStart = CACurrentMediaTime(); fpsFrames = 0; renderDroppedFrames = 0
             videoOutput = video; photoOutput = photo; audioOutput = audio; depthOutput = depth; synchronizer = sync
@@ -231,6 +249,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             installObservers(newSession)
             if desiredRunning { newSession.startRunning() }
             status.running = newSession.isRunning
+            refreshShutter()
             publish()
             if actualFPS < quality.fps { onError?("Для карты глубины камера переключена на \(actualFPS) к/с.") }
         } catch {
@@ -267,7 +286,26 @@ final class CameraService: NSObject, @unchecked Sendable {
         })
     }
 
-    private func startIfDesired() { queue.async { [weak self] in guard let self, self.desiredRunning else { return }; self.session?.startRunning(); self.status.running = self.session?.isRunning == true; self.publish() } }
+    private func startIfDesired() { queue.async { [weak self] in guard let self, self.desiredRunning else { return }; self.session?.startRunning(); self.status.running = self.session?.isRunning == true; self.refreshShutter(); self.publish() } }
+
+    private var shutterRequiresReconfiguration: Bool {
+        guard !status.recording, !status.finishing, !status.photoBusy, status.lens != .front, !settings.wantsDepth else { return false }
+        if settings.shutterAngle > 0 { return device?.isVirtualDevice == true && device?.isExposureModeSupported(.custom) == false }
+        return shutterUsesPhysicalCamera
+    }
+
+    private func refreshShutter() {
+        let angle = settings.shutterAngle
+        guard let device, status.running, !status.photoBusy, failedShutterAngle != angle else { return }
+        do { try shutter.apply(to: device, angle: angle, fps: status.captureFPS, now: CACurrentMediaTime()) }
+        catch { failedShutterAngle = angle; fail(error) }
+    }
+
+    private func shutterReport() -> String {
+        guard let device else { return "Exposure unavailable" }
+        return String(format: "Exposure %@ %.3f ms, ISO %.1f", device.exposureMode == .custom ? "custom" : "auto",
+                      device.exposureDuration.seconds * 1000, device.iso)
+    }
 
     func setZoom(_ zoom: Double, smoothly: Bool = false) {
         guard zoom.isFinite else { return }
@@ -295,7 +333,10 @@ final class CameraService: NSObject, @unchecked Sendable {
                 // Portrait output is rotated 90°. Capture focus coordinates remain sensor-native.
                 let point = CGPoint(x: CGFloat(y), y: CGFloat(status.lens == .front ? x : 1 - x))
                 if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = point; if device.isFocusModeSupported(.autoFocus) { device.focusMode = .autoFocus } }
-                if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = point; if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure } }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = point
+                    if device.exposureMode != .custom, device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+                }
             } catch { fail(error) }
         }
     }
@@ -303,9 +344,10 @@ final class CameraService: NSObject, @unchecked Sendable {
     func capturePhoto() {
         queue.async { [self] in
             guard status.running, !status.recording, !status.finishing, !status.photoBusy, let photoOutput else { return }
+            refreshShutter()
             let options = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
             options.maxPhotoDimensions = photoOutput.maxPhotoDimensions
-            options.photoQualityPrioritization = .balanced
+            options.photoQualityPrioritization = settings.shutterAngle > 0 && device?.exposureMode == .custom ? .speed : .balanced
             options.isDepthDataDeliveryEnabled = settings.wantsDepth && photoOutput.isDepthDataDeliveryEnabled
             options.isDepthDataFiltered = true
             photoSettings = settings
@@ -321,7 +363,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             do {
                 recorder = try MovieRecorder(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer), fps: status.captureFPS, includeAudio: status.audio)
                 audioDegrader.reset()
-                performanceRows = ["Camera recording \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)), target \(status.captureFPS) FPS", "ASCII \(settings.enabled(.ascii)), cell \(settings.value(.ascii, "cell")), contrast \(settings.value(.ascii, "contrast"))", "audio \(status.audio)"]
+                performanceRows = ["Camera recording \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)), target \(status.captureFPS) FPS", "ASCII \(settings.enabled(.ascii)), cell \(settings.value(.ascii, "cell")), contrast \(settings.value(.ascii, "contrast"))", "audio \(status.audio)", shutterReport()]
                 status.recording = true; publish()
             } catch { fail(error) }
         }
@@ -363,6 +405,7 @@ final class CameraService: NSObject, @unchecked Sendable {
 
     private func process(_ sample: CMSampleBuffer, depth: AVDepthData?) {
         guard let buffer = CMSampleBufferGetImageBuffer(sample), let renderer else { return }
+        if settings.shutterAngle > 0 || device?.exposureMode == .custom { refreshShutter() }
         guard pendingVideoFrames < 3 else { renderDroppedFrames += 1; return }
         let sequence = nextSubmission
         nextSubmission &+= 1
@@ -383,8 +426,7 @@ final class CameraService: NSObject, @unchecked Sendable {
             }
         }
         do {
-            try renderer.renderAsync(CIImage(cvPixelBuffer: buffer), depth: depth, settings: settings, time: time.seconds,
-                                     frameDuration: 1.0 / Double(status.captureFPS), completion: complete)
+            try renderer.renderAsync(CIImage(cvPixelBuffer: buffer), depth: depth, settings: settings, time: time.seconds, completion: complete)
         } catch { complete(.failure(error)) }
     }
 
@@ -406,7 +448,7 @@ final class CameraService: NSObject, @unchecked Sendable {
                 status.fps = Int((Double(fpsFrames) / (now - fpsStart)).rounded())
                 status.depthReceiving = frame.depthReceived
                 status.droppedFrames = renderDroppedFrames + (recorder?.droppedFrames ?? 0)
-                if frame.recorder != nil, performanceRows.count < 120 { performanceRows.append("render \(status.fps) FPS, accepted \(frame.recorder?.frameCount ?? 0), drops \(status.droppedFrames)") }
+                if frame.recorder != nil, performanceRows.count < 120 { performanceRows.append("render \(status.fps) FPS, accepted \(frame.recorder?.frameCount ?? 0), drops \(status.droppedFrames), \(shutterReport())") }
                 fpsStart = now; fpsFrames = 0; publish()
             }
         } catch {
@@ -422,8 +464,52 @@ final class CameraService: NSObject, @unchecked Sendable {
     private func saved(_ url: URL) {
         CaptureLibrary.saveToPhotos(url) { [weak self] message in self?.onSaved?(url, message) }
     }
-    private func publish() { onStatus?(status) }
+    private func publish() {
+        status.shutterSupported = device?.isExposureModeSupported(.custom) == true
+        status.shutterDuration = status.running && device?.exposureMode == .custom ? device?.exposureDuration.seconds : nil
+        status.shutterNeedsCameraSwitch = device?.isVirtualDevice == true && !status.shutterSupported && status.lens != .front && !settings.wantsDepth
+        onStatus?(status)
+    }
     private func fail(_ error: Error) { onError?(error.localizedDescription) }
+
+    #if DEBUG
+    static func verifyShutterHardware() async throws -> String {
+        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { return "SKIP camera shutter hardware / camera access" }
+        let service = CameraService()
+        service.start()
+        defer { service.suspend() }
+
+        func reach(angle: Float, expected: Double?) async throws -> String {
+            var settings = EffectSettings()
+            if angle > 0 { settings.toggle(.motion); settings.set(.motion, "shutter", angle) }
+            service.update(settings)
+            var report = "Camera not running"
+            for _ in 0..<20 {
+                try await Task.sleep(for: .milliseconds(200))
+                let state: (running: Bool, custom: Bool, seconds: Double, autoISO: Bool, report: String) = await withCheckedContinuation { continuation in
+                    service.queue.async {
+                        let device = service.device
+                        let autoISO = if #available(iOS 27, *) { device?.automaticallyAdjustsISO == true } else { false }
+                        continuation.resume(returning: (service.status.running, device?.exposureMode == .custom,
+                                                         device?.exposureDuration.seconds ?? 0, autoISO, service.shutterReport()))
+                    }
+                }
+                report = state.report
+                guard state.running else { continue }
+                if let expected, state.custom, abs(state.seconds - expected) < 0.0015 {
+                    return "\(report), Auto ISO \(state.autoISO)"
+                }
+                if expected == nil, !state.custom { return report }
+            }
+            throw TrenchesError.message("Camera shutter \(angle)°: \(report)")
+        }
+
+        let half = try await reach(angle: 180, expected: 1.0 / 60)
+        let full = try await reach(angle: 360, expected: 1.0 / 30)
+        let auto = try await reach(angle: 0, expected: nil)
+        return "PASS camera hardware at 30 FPS / 180° [\(half)] / 360° [\(full)] / off [\(auto)]"
+    }
+    #endif
 }
 
 extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureDataOutputSynchronizerDelegate, AVCapturePhotoCaptureDelegate {

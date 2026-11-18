@@ -25,7 +25,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .color: return "Баланс и характер цвета"
         case .post: return "Зерно, растр и цифровые артефакты"
         case .ascii: return "Из света в символы"
-        case .motion: return "Имитация выдержки в видео. 180° — половина интервала между кадрами."
+        case .motion: return "Выдержка камеры. 180° — половина интервала между кадрами, 0° — автоматическая выдержка."
         case .shakal: return "Пиксели, JPEG-блоки и потеря цвета"
         case .macroblock: return "Смещение блоков по времени и seed"
         case .lensFlare: return "Отражения света и пыль на линзе"
@@ -86,9 +86,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("ink2R", "", 0...1, 1), .slider("ink2G", "", 0...1, 0.3), .slider("ink2B", "", 0...1, 0.6),
             .slider("paperR", "", 0...1, 0), .slider("paperG", "", 0...1, 0), .slider("paperB", "", 0...1, 0)]
         case .motion: return [
-            .slider("shutter", "Угол затвора", 0...360, 180, unit: "°"),
-            .slider("radius", "Максимальная длина смаза", 0...80, 48, unit: "px"),
-            .slider("mix", "Смешивание", 0...1, 1)]
+            .slider("shutter", "Угол затвора", 0...360, 180, unit: "°")]
         case .shakal: return [
             .slider("quality", "Качество JPEG", 1...100, 14, unit: ""),
             .slider("scale", "Понижение разрешения", 1...12, 3, unit: "×"),
@@ -178,6 +176,7 @@ struct EffectSettings: Codable, Equatable {
         effects[effect] = state
     }
     var wantsDepth: Bool { enabled(.dof) && value(.dof, "mode") >= 0.5 }
+    var shutterAngle: Float { enabled(.motion) ? value(.motion, "shutter") : 0 }
     var activeCount: Int { EffectID.allCases.filter { enabled($0) }.count }
     var disabledEffects: Self {
         var copy = self

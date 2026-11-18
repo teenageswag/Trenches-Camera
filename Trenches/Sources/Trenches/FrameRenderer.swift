@@ -20,7 +20,6 @@ final class FrameRenderer {
     private let finish: MTLComputePipelineState
     private let asciiPrepare: MTLComputePipelineState
     private let jpegDegrade: MTLComputePipelineState
-    private let motionBlur: MotionBlur
     private let macroblock: MTLComputePipelineState
     private let brightPass: MTLComputePipelineState
     private let lensComposite: MTLComputePipelineState
@@ -59,7 +58,6 @@ final class FrameRenderer {
         finish = try device.makeComputePipelineState(function: finishFunction)
         asciiPrepare = try device.makeComputePipelineState(function: asciiFunction)
         jpegDegrade = try device.makeComputePipelineState(function: jpegFunction)
-        motionBlur = try MotionBlur(device: device, library: library)
         guard let blocks = library.makeFunction(name: "macroblockCorrupt") else { throw TrenchesError.message("Не найден Macroblock.") }
         macroblock = try device.makeComputePipelineState(function: blocks)
         guard let bright = library.makeFunction(name: "brightPass"), let lens = library.makeFunction(name: "lensComposite"),
@@ -114,15 +112,12 @@ final class FrameRenderer {
     private func prepare(width: Int, height: Int) throws {
         guard size != CGSize(width: width, height: height) else { return }
         pool = nil; source = nil; blurred = nil; intermediate = nil; asciiCells = nil; compressed = nil
-        resetMotion()
         size = .zero
         CVMetalTextureCacheFlush(cache, 0)
         let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height, kCVPixelBufferMetalCompatibilityKey as String: true, kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
         guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess else { throw TrenchesError.message("Не удалось создать пул кадров.") }
         size = CGSize(width: width, height: height)
     }
-
-    func resetMotion() { motionBlur.reset() }
 
     private func scratch(_ cached: inout MTLTexture?, width: Int, height: Int, format: MTLPixelFormat = .rgba8Unorm) throws -> MTLTexture {
         if let cached, cached.width == width, cached.height == height, cached.pixelFormat == format { return cached }
@@ -150,9 +145,9 @@ final class FrameRenderer {
         return frame.output
     }
 
-    func renderAsync(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double, frameDuration: Double = 1.0 / 30,
+    func renderAsync(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double,
                      completion: @escaping (Result<CVPixelBuffer, Error>) -> Void) throws {
-        let frame = try encodeFrame(image, depth: depth, settings: settings, time: time, frameDuration: frameDuration)
+        let frame = try encodeFrame(image, depth: depth, settings: settings, time: time)
         let resources = frame.resources
         let output = frame.output
         frame.command.addCompletedHandler { command in
@@ -164,7 +159,7 @@ final class FrameRenderer {
         frame.command.commit()
     }
 
-    private func encodeFrame(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double, frameDuration: Double = 1.0 / 30) throws -> PendingFrame {
+    private func encodeFrame(_ image: CIImage, depth: AVDepthData?, settings: EffectSettings, time: Double) throws -> PendingFrame {
         let width = Int(image.extent.width), height = Int(image.extent.height)
         try prepare(width: width, height: height)
         guard let pool, let command = queue.makeCommandBuffer() else { throw TrenchesError.message("Не удалось подготовить кадр.") }
@@ -179,8 +174,7 @@ final class FrameRenderer {
         let input = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
         let bounds = CGRect(origin: .zero, size: size)
         var resources: [Any] = [image, outputReference]
-        if settings.activeCount == 0 {
-            resetMotion()
+        if settings.activeCount == (settings.enabled(.motion) ? 1 : 0) {
             let destination = CIRenderDestination(mtlTexture: outputTexture, commandBuffer: command)
             destination.isFlipped = true
             destination.colorSpace = colorSpace
@@ -193,7 +187,6 @@ final class FrameRenderer {
         destination.isFlipped = true
         destination.colorSpace = colorSpace
         _ = try context.startTask(toRender: input, from: bounds, to: destination, at: .zero)
-        source = try motionBlur.encode(source: source, command: command, settings: settings, time: time, frameDuration: frameDuration)
         if settings.enabled(.bloom) || settings.enabled(.lensFlare) {
             let w = max(1, width / 4), h = max(1, height / 4)
             let bright = try scratch(&highlights, width: w, height: h, format: .rgba16Float)

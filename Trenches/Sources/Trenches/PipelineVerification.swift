@@ -29,7 +29,8 @@ enum PipelineVerification {
                 record("PASS effect \(effect.rawValue)")
             }
             try verifyASCIIShadows(renderer: renderer, record: record)
-            try verifyMotionBlur(renderer: renderer, record: record)
+            try verifyCameraShutter(record: record)
+            record(try await CameraService.verifyShutterHardware())
             try await verifyDatamosh(renderer: renderer, record: record)
             var stacked = EffectSettings()
             EffectID.allCases.forEach { stacked.toggle($0) }
@@ -101,90 +102,18 @@ enum PipelineVerification {
         record("PASS ASCII 6 px/300% / black background and shadow glyphs: \(ink)")
     }
 
-    private static func verifyMotionBlur(renderer: FrameRenderer, record: (String) -> Void) throws {
-        let width = 320, height = 384
-        func frame(offset: Int, subjectOnly: Bool, noisy: Bool = false) -> CIImage {
-            func texture(_ x: Int, _ y: Int) -> Double {
-                let x = Double(x), y = Double(y)
-                return 0.18 + 0.06 * sin(0.09 * x + 0.03 * y) + 0.08 * cos(0.1 * y + 0.039 * x)
-                    + (sin(0.23 * x + 0.11 * y) > 0.1 ? 0.12 : 0)
-                    + (sin(0.17 * x - 0.19 * y) > 0.3 ? 0.13 : 0)
-            }
-            var pixels = [UInt8](repeating: 255, count: width * height * 4)
-            for y in 0..<height {
-                for x in 0..<width {
-                    let u = x - offset
-                    let inside = subjectOnly && (62..<160).contains(u) && (102..<228).contains(y)
-                    let value = inside ? 0.28 + texture(u + 93, y + 67) : texture(subjectOnly ? x : u, y)
-                    let noise = noisy ? (x * 73 ^ y * 31) % 5 - 2 : 0
-                    let gray = UInt8(clamping: Int((value * 255).rounded()) + noise)
-                    let index = (y * width + x) * 4
-                    pixels[index] = gray; pixels[index + 1] = gray; pixels[index + 2] = gray
-                }
-            }
-            return CIImage(bitmapData: Data(pixels), bytesPerRow: width * 4, size: CGSize(width: width, height: height),
-                           format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+    private static func verifyCameraShutter(record: (String) -> Void) throws {
+        let minimum = CMTime(value: 1, timescale: 8_000), maximum = CMTime(value: 1, timescale: 2)
+        func duration(_ angle: Float, _ fps: Int32) -> CMTime? {
+            CameraShutter.duration(angle: angle, fps: fps, minimum: minimum, maximum: maximum)
         }
-        var motion = EffectSettings()
-        motion.toggle(.motion)
-        motion.set(.motion, "radius", 80)
-        let previous = frame(offset: 0, subjectOnly: false), current = frame(offset: 24, subjectOnly: false)
-        func render(_ image: CIImage, at time: Double) throws -> [UInt8] {
-            bytes(try renderer.render(image, depth: nil, settings: motion, time: time))
+        guard duration(0, 30) == nil, duration(0.01, 30) == minimum,
+              duration(360, 30).map({ abs($0.seconds - 1.0 / 30) < 0.00001 }) == true,
+              duration(180, 60).map({ abs($0.seconds - 1.0 / 120) < 0.00001 }) == true,
+              CameraShutter.duration(angle: 360, fps: 30, minimum: minimum, maximum: CMTime(value: 1, timescale: 60)) == CMTime(value: 1, timescale: 60) else {
+            throw TrenchesError.message("Угол затвора не учитывает FPS или пределы сенсора")
         }
-        func difference(_ a: [UInt8], _ b: [UInt8], x: Range<Int>, y: Range<Int>) -> Double {
-            var sum = 0
-            for row in y { for col in x {
-                let i = (row * width + col) * 4
-                sum += abs(Int(a[i]) - Int(b[i]))
-            } }
-            return Double(sum) / Double(x.count * y.count)
-        }
-        renderer.resetMotion()
-        let sharp = try render(current, at: 1)
-        let still = try render(current, at: 1 + 1.0 / 30)
-        _ = try render(frame(offset: 24, subjectOnly: false, noisy: true), at: 1 + 2.0 / 30)
-        let afterNoise = try render(current, at: 1 + 3.0 / 30)
-        let afterGap = try render(previous, at: 1.5)
-        renderer.resetMotion()
-        let first = try render(previous, at: 2)
-        guard still == sharp, afterGap == first, difference(afterNoise, sharp, x: 8..<312, y: 8..<376) < 0.5 else {
-            throw TrenchesError.message("Motion Blur смазывает статичный кадр, шум или кадр после паузы")
-        }
-        record("PASS Motion Blur stationary image, sensor noise and capture gap")
-
-        let pan = try render(current, at: 2 + 1.0 / 30)
-        // A 24 px horizontal translation at 180° is a 12 px exposure, centered on the current frame.
-        var expected = sharp
-        for y in 45..<330 { for x in 45..<280 {
-            var sum = 0.0
-            for sample in (x - 6)...(x + 6) { sum += pow(Double(sharp[(y * width + sample) * 4]), 2) }
-            expected[(y * width + x) * 4] = UInt8(clamping: Int(sqrt(sum / 13).rounded()))
-        } }
-        let panError = difference(pan, expected, x: 45..<280, y: 45..<330)
-        let sharpError = difference(sharp, expected, x: 45..<280, y: 45..<330)
-        guard panError < sharpError * 0.75 else { throw TrenchesError.message("Motion Blur не воспроизводит направление панорамы") }
-
-        motion.set(.motion, "shutter", 45)
-        renderer.resetMotion()
-        _ = try render(previous, at: 3)
-        let short = try render(current, at: 3 + 1.0 / 30)
-        guard difference(short, sharp, x: 45..<280, y: 45..<330) < difference(pan, sharp, x: 45..<280, y: 45..<330) * 0.6 else {
-            throw TrenchesError.message("Угол затвора Motion Blur не меняет длину смаза")
-        }
-        record("PASS Motion Blur horizontal pan and shutter control")
-
-        motion.set(.motion, "shutter", 180)
-        renderer.resetMotion()
-        let subject = frame(offset: 24, subjectOnly: true)
-        let sharpSubject = try render(subject, at: 4)
-        _ = try render(frame(offset: 0, subjectOnly: true), at: 4.5)
-        let movingSubject = try render(subject, at: 4.5 + 1.0 / 30)
-        guard difference(movingSubject, sharpSubject, x: 92..<175, y: 120..<206) > 2,
-              difference(movingSubject, sharpSubject, x: 205..<285, y: 20..<350) == 0 else {
-            throw TrenchesError.message("Motion Blur не отделяет движение объекта от статичного фона")
-        }
-        record("PASS Motion Blur moving subject over stationary background")
+        record("PASS camera shutter angle / capture cadence / hardware range")
     }
 
     private static func verifyDatamosh(renderer: FrameRenderer, record: (String) -> Void) async throws {
