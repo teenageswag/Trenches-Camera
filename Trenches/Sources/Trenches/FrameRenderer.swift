@@ -87,7 +87,7 @@ final class FrameRenderer {
             for mode in ASCIISymbols.allCases {
               for (index, character) in Array(mode.characters).enumerated() {
                 let string = NSAttributedString(string: String(character), attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font, NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true])
-                cg.textPosition = CGPoint(x: index * 32 + 5, y: height - (mode.rawValue + 1) * 48 + 12)
+                cg.textPosition = CGPoint(x: index * 32 + 6, y: mode.rawValue * 48 + 12)
                 CTLineDraw(CTLineCreateWithAttributedString(string), cg)
               }
             }
@@ -96,7 +96,7 @@ final class FrameRenderer {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: width, height: height, mipmapped: false)
         descriptor.usage = .shaderRead
         guard ok, let texture = device.makeTexture(descriptor: descriptor) else { throw TrenchesError.message("Не удалось создать ASCII-атлас.") }
-        // CGContext's first row is the bottom of a glyph; Metal samples from the top.
+        // Flipping the bitmap preserves the classic glyph orientation and puts mode 0 in the first texture row.
         var flipped = bytes
         for y in 0..<height { flipped.replaceSubrange((y * width)..<((y + 1) * width), with: bytes[((height - y - 1) * width)..<((height - y) * width)]) }
         flipped.withUnsafeBytes { texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: width) }
