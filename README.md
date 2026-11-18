@@ -45,7 +45,7 @@ Metal вычисляет движение и остаток предсказан
 
 ## Установка
 
-Скачай `trenches-1.3.0.ipa` во вкладке **Releases** и установи через [Sideloadly](https://sideloadly.io/) со своим Apple ID. Общий IPA требует собственной подписи; простое открытие файла на iPhone его не устанавливает.
+Скачай `trenches-1.3.1.ipa` во вкладке **Releases** и установи через [Sideloadly](https://sideloadly.io/) со своим Apple ID. Общий IPA требует собственной подписи.
 
 Пошагово: [установка и обновление](docs/INSTALLATION.md).
 
