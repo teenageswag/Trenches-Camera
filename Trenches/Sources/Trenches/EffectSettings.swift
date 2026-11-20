@@ -1,7 +1,7 @@
 import Foundation
 
 enum EffectID: String, Codable, CaseIterable, Identifiable {
-    case dof, bloom, tone, color, post, ascii, motion, shakal, macroblock, lensFlare
+    case dof, bloom, tone, color, post, dither, ascii, motion, shakal, macroblock, lensFlare
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -10,6 +10,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .tone: return "Свет"
         case .color: return "Цвет"
         case .post: return "POST FX"
+        case .dither: return "Dither"
         case .ascii: return "ASCII"
         case .motion: return "Motion blur"
         case .shakal: return "Шакализация"
@@ -24,6 +25,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .tone: return "Экспозиция и тональная компрессия"
         case .color: return "Баланс и характер цвета"
         case .post: return "Зерно, растр и цифровые артефакты"
+        case .dither: return "Дизеринг с ограниченной палитрой"
         case .ascii: return "Из света в символы"
         case .motion: return "Выдержка камеры. 180° — половина интервала между кадрами, 0° — автоматическая выдержка."
         case .shakal: return "Пиксели, JPEG-блоки и потеря цвета"
@@ -38,6 +40,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .tone: return "sun.max"
         case .color: return "slider.horizontal.3"
         case .post: return "waveform.path"
+        case .dither: return "circle.lefthalf.filled"
         case .ascii: return "textformat.abc"
         case .motion: return "wind"
         case .shakal: return "square.grid.3x3"
@@ -45,7 +48,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
         case .lensFlare: return "camera.filters"
         }
     }
-    var mark: String { ["()", "**", "+/-", "RGB", "///", "#", "~>", "jpg", "8×8", "(*)"][Self.allCases.firstIndex(of: self)!] }
+    var mark: String { ["()", "**", "+/-", "RGB", "///", ":.:", "#", "~>", "jpg", "8×8", "(*)"][Self.allCases.firstIndex(of: self)!] }
     var parameters: [EffectParameter] {
         switch self {
         case .dof: return [
@@ -75,6 +78,7 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("scan", "Scanlines", 0...1, 0),
             .slider("halftone", "Халфтон", 0...1, 0),
             .slider("pixel", "Пикселизация", 1...48, 1, unit: "px")]
+        case .dither: return DitherMode.parameters
         case .ascii: return [
             .slider("cell", "Размер символов", 2...96, 12, unit: "px"),
             .slider("contrast", "Контраст символов", 0.1...10, 1.2),
@@ -111,6 +115,45 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum DitherMode: Int, CaseIterable {
+    case bayer2, bayer4, bayer8, blueNoise, whiteNoise, floydSteinberg, atkinson, jarvisJudiceNinke, stucki, sierra, burkes
+
+    var title: String {
+        switch self {
+        case .bayer2: return "Bayer 2×2"
+        case .bayer4: return "Bayer 4×4"
+        case .bayer8: return "Bayer 8×8"
+        case .blueNoise: return "Blue noise"
+        case .whiteNoise: return "White noise"
+        case .floydSteinberg: return "Floyd–Steinberg"
+        case .atkinson: return "Atkinson"
+        case .jarvisJudiceNinke: return "Jarvis–Judice–Ninke"
+        case .stucki: return "Stucki"
+        case .sierra: return "Sierra"
+        case .burkes: return "Burkes"
+        }
+    }
+
+    var diffusesError: Bool { rawValue >= Self.floydSteinberg.rawValue }
+
+    static let parameters: [EffectParameter] = [
+        .choice("mode", "Режим", allCases.map(\.title), initial: bayer4.rawValue),
+        .slider("pixel", "Размер пикселя", 1...64, 4, unit: "px", step: 1),
+        .slider("threshold", "Порог", 0...1, 0.5),
+        .slider("intensity", "Интенсивность", 0...1, 1),
+        .slider("levels", "Уровни", 2...16, 2, unit: "", step: 1),
+        .choice("palette", "Палитра", DitherPalette.allCases.map(\.title)),
+        .slider("mix", "Смешивание", 0...1, 1),
+        .slider("darkR", "", 0...1, 0.06), .slider("darkG", "", 0...1, 0.08), .slider("darkB", "", 0...1, 0.12),
+        .slider("lightR", "", 0...1, 1), .slider("lightG", "", 0...1, 0.81), .slider("lightB", "", 0...1, 0.55)
+    ]
+}
+
+enum DitherPalette: Int, CaseIterable {
+    case monochrome, duotone, source, handheld, phosphor, risograph
+    var title: String { ["Чёрно-белая", "Дуотон", "Цвета кадра", "Зелёный LCD", "Янтарный CRT", "Ризограф"][rawValue] }
+}
+
 enum ASCIISymbols: Int, CaseIterable {
     case classic, detailed, blocks, binary
     var title: String { ["Классика", "Детальные", "Блоки", "Двоичные"][rawValue] }
@@ -131,12 +174,13 @@ struct EffectParameter: Identifiable {
     let initial: Float
     var unit = "%"
     var choices: [String] = []
+    var step: Float?
 
-    static func slider(_ id: String, _ title: String, _ range: ClosedRange<Float>, _ initial: Float, unit: String = "%") -> Self {
-        Self(id: id, title: title, range: range, initial: initial, unit: unit)
+    static func slider(_ id: String, _ title: String, _ range: ClosedRange<Float>, _ initial: Float, unit: String = "%", step: Float? = nil) -> Self {
+        Self(id: id, title: title, range: range, initial: initial, unit: unit, step: step)
     }
-    static func choice(_ id: String, _ title: String, _ values: [String]) -> Self {
-        Self(id: id, title: title, range: 0...Float(values.count - 1), initial: 0, choices: values)
+    static func choice(_ id: String, _ title: String, _ values: [String], initial: Int = 0) -> Self {
+        Self(id: id, title: title, range: 0...Float(values.count - 1), initial: Float(initial), choices: values)
     }
     func formatted(_ value: Float) -> String {
         if !choices.isEmpty { return choices[min(choices.count - 1, max(0, Int(value)))] }

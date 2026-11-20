@@ -23,6 +23,10 @@ final class FrameRenderer {
     private let macroblock: MTLComputePipelineState
     private let brightPass: MTLComputePipelineState
     private let lensComposite: MTLComputePipelineState
+    private let ditherThreshold: MTLComputePipelineState
+    private let ditherInput: MTLComputePipelineState
+    private let ditherDiffuse: MTLComputePipelineState
+    private let blueNoise: MTLTexture
     private let dirt: MTLTexture
     private let atlas: MTLTexture
     private var cache: CVMetalTextureCache!
@@ -37,6 +41,8 @@ final class FrameRenderer {
     private var highlights: MTLTexture?
     private var glow: MTLTexture?
     private var lightOutput: MTLTexture?
+    private var ditherSignal: MTLTexture?
+    private var ditherGrid: MTLTexture?
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     init() throws {
@@ -67,6 +73,15 @@ final class FrameRenderer {
         brightPass = try device.makeComputePipelineState(function: bright)
         lensComposite = try device.makeComputePipelineState(function: lens)
         dirt = try MTKTextureLoader(device: device).newTexture(URL: dirtURL, options: [.SRGB: false, .origin: MTKTextureLoader.Origin.topLeft])
+        guard let threshold = library.makeFunction(name: "ditherThreshold"), let input = library.makeFunction(name: "ditherInput"),
+              let diffuse = library.makeFunction(name: "ditherDiffuse"),
+              let noiseURL = Bundle.module.url(forResource: "DitherBlueNoise", withExtension: "png", subdirectory: "Assets") else {
+            throw TrenchesError.message("Не найдены ресурсы Dither.")
+        }
+        ditherThreshold = try device.makeComputePipelineState(function: threshold)
+        ditherInput = try device.makeComputePipelineState(function: input)
+        ditherDiffuse = try device.makeComputePipelineState(function: diffuse)
+        blueNoise = try MTKTextureLoader(device: device).newTexture(URL: noiseURL, options: [.SRGB: false, .origin: MTKTextureLoader.Origin.topLeft])
         atlas = try Self.makeAtlas(device, queue: queue)
         guard CVMetalTextureCacheCreate(nil, nil, device, nil, &cache) == kCVReturnSuccess else {
             throw TrenchesError.message("Не удалось создать кэш текстур.")
@@ -223,7 +238,7 @@ final class FrameRenderer {
                 depthTexture = CVMetalTextureGetTexture(depthReference)
             }
         }
-        var p = [SIMD4<Float>](repeating: .zero, count: 18)
+        var p = [SIMD4<Float>](repeating: .zero, count: 22)
         func on(_ id: EffectID) -> Float { settings.enabled(id) ? 1 : 0 }
         p[0] = SIMD4(on(.dof), settings.value(.dof, "mode"), depthTexture == nil ? 0 : 1, 0)
         p[1] = SIMD4(settings.value(.dof, "focus"), settings.value(.dof, "range"), settings.value(.dof, "radius"), 0)
@@ -275,18 +290,54 @@ final class FrameRenderer {
             encoder.dispatchThreadgroups(MTLSize(width: w / 8, height: h / 8, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
             encoder.endEncoding()
         }
+        var dither = atlas
+        if settings.enabled(.dither), settings.value(.dither, "mix") > 0 {
+            let mode = DitherMode(rawValue: Int(settings.value(.dither, "mode"))) ?? .bayer4
+            let pixel = settings.value(.dither, "pixel").rounded() * Float(width) / 1080
+            let w = min(width, Int(ceil(Float(width) / pixel)))
+            let h = min(height, Int(ceil(Float(height) / pixel)))
+            p[18] = SIMD4(Float(mode.rawValue), settings.value(.dither, "levels").rounded() - 1,
+                          settings.value(.dither, "intensity"), settings.value(.dither, "threshold"))
+            p[19] = SIMD4(settings.value(.dither, "palette"), settings.value(.dither, "mix"), 0, 0)
+            p[20] = SIMD4(settings.value(.dither, "darkR"), settings.value(.dither, "darkG"), settings.value(.dither, "darkB"), 0)
+            p[21] = SIMD4(settings.value(.dither, "lightR"), settings.value(.dither, "lightG"), settings.value(.dither, "lightB"), 0)
+            dither = try scratch(&ditherGrid, width: w, height: h)
+            if mode.diffusesError {
+                let signal = try scratch(&ditherSignal, width: w, height: h, format: .rgba16Float)
+                try Self.encode(command, pipeline: ditherInput, textures: [graded, compressedTexture, signal], parameters: p, width: w, height: h)
+                try encodeDiffusion(command, input: signal, output: dither, parameters: p)
+            } else {
+                try Self.encode(command, pipeline: ditherThreshold, textures: [graded, compressedTexture, blueNoise, dither], parameters: p, width: w, height: h)
+            }
+        }
         var cells = atlas
         if settings.enabled(.ascii) {
             let cell = settings.value(.ascii, "cell") * Float(width) / 1080
             let w = max(1, Int(ceil(Float(width) / cell)))
             let h = max(1, Int(ceil(Float(height) / (cell * 1.5))))
             cells = try scratch(&asciiCells, width: w, height: h)
-            try Self.encode(command, pipeline: asciiPrepare, textures: [graded, compressedTexture, cells], parameters: p, width: w, height: h)
+            try Self.encode(command, pipeline: asciiPrepare, textures: [graded, compressedTexture, dither, cells], parameters: p, width: w, height: h)
         }
-        try Self.encode(command, pipeline: finish, textures: [graded, atlas, compressedTexture, cells, outputTexture], parameters: p, width: width, height: height)
+        try Self.encode(command, pipeline: finish, textures: [graded, atlas, compressedTexture, cells, dither, outputTexture], parameters: p, width: width, height: height)
         if let depthReference { resources.append(depthReference) }
         if let convertedDepth { resources.append(convertedDepth) }
         return PendingFrame(output: output, command: command, resources: resources)
+    }
+
+    private func encodeDiffusion(_ command: MTLCommandBuffer, input: MTLTexture, output: MTLTexture,
+                                 parameters: [SIMD4<Float>]) throws {
+        let simdWidth = ditherDiffuse.threadExecutionWidth
+        guard simdWidth >= 22, let encoder = command.makeComputeCommandEncoder() else {
+            throw TrenchesError.message("Metal не смог запустить диффузию ошибки.")
+        }
+        encoder.setComputePipelineState(ditherDiffuse)
+        encoder.setTexture(input, index: 0)
+        encoder.setTexture(output, index: 1)
+        parameters.withUnsafeBytes { encoder.setBytes($0.baseAddress!, length: $0.count, index: 0) }
+        // One SIMD group per 32×16 output tile, including six preparatory rows.
+        let tiles = MTLSize(width: (output.width + 31) / 32, height: (output.height + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(tiles, threadsPerThreadgroup: MTLSize(width: simdWidth, height: 1, depth: 1))
+        encoder.endEncoding()
     }
 
     static func encode(_ command: MTLCommandBuffer, pipeline: MTLComputePipelineState, textures: [MTLTexture], parameters: [SIMD4<Float>], width: Int, height: Int) throws {

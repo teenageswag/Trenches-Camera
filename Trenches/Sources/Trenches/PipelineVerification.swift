@@ -28,6 +28,7 @@ enum PipelineVerification {
                 guard bytes(output) != baselineBytes else { throw TrenchesError.message("Эффект \(effect.rawValue) не изменил кадр") }
                 record("PASS effect \(effect.rawValue)")
             }
+            try verifyDither(renderer: renderer, image: image, baseline: baselineBytes, record: record)
             try verifyASCIIShadows(renderer: renderer, record: record)
             try verifyCameraShutter(record: record)
             record(try await CameraService.verifyShutterHardware())
@@ -67,11 +68,49 @@ enum PipelineVerification {
             record(throughput)
             let recording = try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: ascii, paced: true).run()
             record(recording)
+            var dither = EffectSettings()
+            dither.toggle(.dither)
+            dither.set(.dither, "mode", Float(DitherMode.jarvisJudiceNinke.rawValue))
+            dither.set(.dither, "palette", Float(DitherPalette.source.rawValue))
+            for pixel: Float in [4, 1] {
+                dither.set(.dither, "pixel", pixel)
+                record("BENCH Dither JJN / RGB / \(Int(pixel)) px / 1080×1920")
+                record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: dither, paced: false).run())
+                record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: dither, paced: true).run())
+            }
             record("COMPLETE")
         } catch { record("FAIL \(error.localizedDescription)") }
         let report = lines.joined(separator: "\n")
         if let directory = try? CaptureLibrary.directory().deletingLastPathComponent() { try? report.write(to: directory.appendingPathComponent("verification.txt"), atomically: true, encoding: .utf8) }
         return report
+    }
+
+    private static func verifyDither(renderer: FrameRenderer, image: CIImage, baseline: [UInt8], record: (String) -> Void) throws {
+        var settings = EffectSettings()
+        settings.toggle(.dither)
+        var patterns: Set<Data> = []
+        for mode in DitherMode.allCases {
+            settings.set(.dither, "mode", Float(mode.rawValue))
+            let first = bytes(try renderer.render(image, depth: nil, settings: settings, time: 1))
+            let second = bytes(try renderer.render(image, depth: nil, settings: settings, time: 2))
+            let channels = Set(stride(from: 0, to: first.count, by: 4).map { first[$0] })
+            guard first == second, channels == [0, 255], patterns.insert(Data(first)).inserted else {
+                throw TrenchesError.message("Некорректный или повторяющийся режим Dither: \(mode.title)")
+            }
+        }
+        settings.set(.dither, "palette", Float(DitherPalette.duotone.rawValue))
+        settings.set(.dither, "mode", Float(DitherMode.bayer4.rawValue))
+        settings.set(.dither, "darkR", 1); settings.set(.dither, "darkG", 0); settings.set(.dither, "darkB", 0)
+        settings.set(.dither, "lightR", 0); settings.set(.dither, "lightG", 0); settings.set(.dither, "lightB", 1)
+        let duotone = bytes(try renderer.render(image, depth: nil, settings: settings, time: 1))
+        guard stride(from: 0, to: duotone.count, by: 4).allSatisfy({ i in
+            duotone[i + 1] == 0 && Int(duotone[i]) + Int(duotone[i + 2]) == 255
+        }) else { throw TrenchesError.message("Dither вышел за цвета дуотона") }
+        settings.set(.dither, "mix", 0)
+        guard bytes(try renderer.render(image, depth: nil, settings: settings, time: 1)) == baseline else {
+            throw TrenchesError.message("Dither меняет изображение при нулевом смешивании")
+        }
+        record("PASS Dither 11 unique modes / deterministic mask / duotone / mix at zero")
     }
 
     private static func verifyASCIIShadows(renderer: FrameRenderer, record: (String) -> Void) throws {

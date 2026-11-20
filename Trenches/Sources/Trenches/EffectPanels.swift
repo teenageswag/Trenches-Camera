@@ -72,12 +72,18 @@ struct EffectEditor: View {
                 if effect == .ascii {
                     Section("Цвета ASCII") {
                         if model.settings.value(.ascii, "palette") >= 4 {
-                            ColorPicker("Цвет символов", selection: asciiColor("ink"), supportsOpacity: false)
+                            ColorPicker("Цвет символов", selection: effectColor("ink"), supportsOpacity: false)
                         }
                         if model.settings.value(.ascii, "palette") >= 5 {
-                            ColorPicker("Второй цвет символов", selection: asciiColor("ink2"), supportsOpacity: false)
+                            ColorPicker("Второй цвет символов", selection: effectColor("ink2"), supportsOpacity: false)
                         }
-                        ColorPicker("Цвет фона", selection: asciiColor("paper"), supportsOpacity: false)
+                        ColorPicker("Цвет фона", selection: effectColor("paper"), supportsOpacity: false)
+                    }
+                }
+                if effect == .dither, model.settings.value(.dither, "palette") == Float(DitherPalette.duotone.rawValue) {
+                    Section("Дуотон") {
+                        ColorPicker("Цвет теней", selection: effectColor("dark"), supportsOpacity: false)
+                        ColorPicker("Цвет светов", selection: effectColor("light"), supportsOpacity: false)
                     }
                 }
                 if effect == .dof {
@@ -100,20 +106,20 @@ struct EffectEditor: View {
     }
 
     private func visible(_ parameter: EffectParameter) -> Bool {
-        if effect == .ascii, parameter.title.isEmpty { return false }
+        if parameter.title.isEmpty { return false }
         if effect == .shakal, ["audioBits", "audioRate", "audioMix"].contains(parameter.id) { return model.settings.value(.shakal, "audio") > 0.5 }
         guard effect == .dof else { return true }
         let depthMode = model.settings.value(.dof, "mode") >= 0.5
         return parameter.id == "radius" ? !depthMode : (["focus", "range"].contains(parameter.id) ? depthMode : true)
     }
-    private func asciiColor(_ prefix: String) -> Binding<Color> {
+    private func effectColor(_ prefix: String) -> Binding<Color> {
         Binding(get: {
-            Color(red: Double(model.settings.value(.ascii, prefix + "R")), green: Double(model.settings.value(.ascii, prefix + "G")), blue: Double(model.settings.value(.ascii, prefix + "B")))
+            Color(red: Double(model.settings.value(effect, prefix + "R")), green: Double(model.settings.value(effect, prefix + "G")), blue: Double(model.settings.value(effect, prefix + "B")))
         }, set: { color in
             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
             guard UIColor(color).getRed(&r, green: &g, blue: &b, alpha: &a) else { return }
             var settings = model.settings
-            settings.set(.ascii, prefix + "R", Float(r)); settings.set(.ascii, prefix + "G", Float(g)); settings.set(.ascii, prefix + "B", Float(b))
+            settings.set(effect, prefix + "R", Float(r)); settings.set(effect, prefix + "G", Float(g)); settings.set(effect, prefix + "B", Float(b))
             model.settings = settings
         })
     }
@@ -132,8 +138,13 @@ struct EffectEditor: View {
                     Spacer()
                     Text(parameter.formatted(model.settings.value(effect, parameter.id))).font(.system(.subheadline, design: .monospaced)).foregroundStyle(TrenchesTheme.accent).monospacedDigit()
                 }
-                Slider(value: binding(parameter), in: parameter.range) { Text(parameter.title) }
-                    .accessibilityValue(parameter.formatted(model.settings.value(effect, parameter.id)))
+                Group {
+                    if let step = parameter.step {
+                        Slider(value: binding(parameter), in: parameter.range, step: step) { Text(parameter.title) }
+                    } else {
+                        Slider(value: binding(parameter), in: parameter.range) { Text(parameter.title) }
+                    }
+                }.accessibilityValue(parameter.formatted(model.settings.value(effect, parameter.id)))
             }.padding(.vertical, 7)
         }
     }

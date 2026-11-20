@@ -313,15 +313,154 @@ float3 postSample(texture2d<float, access::sample> source,
     return c;
 }
 
+float3 postAppearance(texture2d<float, access::sample> source, texture2d<float, access::sample> compressed,
+                      float2 uv, constant float4 *p, float2 size) {
+    uint2 gid = uint2(uv * size);
+    float3 c = postSample(source, compressed, uv, p, size);
+    if (p[7].x > 0.5) {
+        float n = fract(sin(dot(float2(gid), float2(12.9898, 78.233)) + p[8].z * 57.0) * 43758.5453) - 0.5;
+        c += n * p[7].y * 0.23;
+        float scanBand = step(0.5, fract((float(gid.y) + 0.5) * 1080.0 / size.x / 3.0));
+        c *= 1.0 - p[8].x * scanBand * 0.45;
+        if (p[8].y > 0.001) {
+            float cell = 7.0 * size.x / 1080.0;
+            float2 cellUV = (floor(float2(gid) / cell) + 0.5) * cell / size;
+            float l = clamp(luminance(postSample(source, compressed, cellUV, p, size)), 0.0, 1.0);
+            float radius = sqrt(l) * 0.7;
+            float d = length(fract(float2(gid) / cell) - 0.5);
+            float ink = 1.0 - smoothstep(radius - 0.06, radius + 0.06, d);
+            c = mix(c, float3(ink), p[8].y);
+        }
+    }
+    return c;
+}
+
+// Bayer recursion is described in Ulichney's void-and-cluster paper:
+// https://cv.ulichney.com/papers/1993-void-cluster.pdf
+float bayerRank(uint2 pixel, uint bits) {
+    uint rank = 0;
+    for (uint bit = 0; bit < bits; ++bit) {
+        uint x = (pixel.x >> bit) & 1u;
+        uint y = (pixel.y >> bit) & 1u;
+        rank = rank * 4u + ((x ^ y) * 2u + y);
+    }
+    return (float(rank) + 0.5) / float(1u << (2u * bits));
+}
+
+float3 ditherSignal(float3 color, constant float4 *d) {
+    float3 signal = int(d[1].x) == 2 ? color : float3(luminance(color));
+    return saturate(signal + (0.5 - d[0].w));
+}
+
+float3 ditherQuantize(float3 signal, float intervals) {
+    return floor(saturate(signal) * intervals + 0.5) / intervals;
+}
+
+float3 ditherColor(float3 level, constant float4 *d) {
+    switch (int(d[1].x)) {
+        case 1: return mix(d[2].rgb, d[3].rgb, level.x);
+        case 3: return mix(float3(0.06, 0.16, 0.12), float3(0.70, 0.80, 0.37), level.x);
+        case 4: return mix(float3(0.08, 0.04, 0.03), float3(1.00, 0.69, 0.25), level.x);
+        case 5: {
+            float x = level.x * 2.0;
+            float3 blue = float3(0.16, 0.29, 0.55), pink = float3(0.82, 0.34, 0.44), paper = float3(0.98, 0.93, 0.74);
+            return x < 1.0 ? mix(blue, pink, x) : mix(pink, paper, x - 1.0);
+        }
+        default: return level;
+    }
+}
+
+kernel void ditherThreshold(texture2d<float, access::sample> source [[texture(0)]],
+                            texture2d<float, access::sample> compressed [[texture(1)]],
+                            texture2d<float, access::read> blueNoise [[texture(2)]],
+                            texture2d<float, access::write> grid [[texture(3)]],
+                            constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= grid.get_width() || gid.y >= grid.get_height()) return;
+    constant float4 *d = p + 18;
+    float2 uv = (float2(gid) + 0.5) / float2(grid.get_width(), grid.get_height());
+    float3 input = ditherSignal(postAppearance(source, compressed, uv, p, p[12].zw), d);
+    uint mode = uint(d[0].x);
+    float rank;
+    if (mode <= 2) rank = bayerRank(gid, mode + 1);
+    // Uniform void-and-cluster ranks by Christoph Peters (CC0): https://momentsingraphics.de/BlueNoise.html
+    else if (mode == 3) rank = blueNoise.read(gid % uint2(blueNoise.get_width(), blueNoise.get_height())).r;
+    else rank = blockRandom(blockHash(gid, 0u, 271u));
+    float3 level = ditherQuantize(input + (0.5 - rank) * d[0].z / d[0].y, d[0].y);
+    grid.write(float4(ditherColor(level, d), 1.0), gid);
+}
+
+kernel void ditherInput(texture2d<float, access::sample> source [[texture(0)]],
+                        texture2d<float, access::sample> compressed [[texture(1)]],
+                        texture2d<float, access::write> grid [[texture(2)]],
+                        constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= grid.get_width() || gid.y >= grid.get_height()) return;
+    float2 uv = (float2(gid) + 0.5) / float2(grid.get_width(), grid.get_height());
+    float3 signal = ditherSignal(postAppearance(source, compressed, uv, p, p[12].zw), p + 18);
+    grid.write(float4(signal, 1.0), gid);
+}
+
+// Coefficients: https://github.com/SixLabors/ImageSharp/blob/main/src/ImageSharp/Processing/Processors/Dithering/DHALF.TXT
+// Two right neighbors, five in each subsequent row (-2 ... +2), then the divisor.
+constant float errorWeights[6][13] = {
+    {7,0, 0,3,5,1,0, 0,0,0,0,0, 16},       // Floyd–Steinberg
+    {1,1, 0,1,1,1,0, 0,0,1,0,0,  8},       // Atkinson
+    {7,5, 3,5,7,5,3, 1,3,5,3,1, 48},       // Jarvis–Judice–Ninke
+    {8,4, 2,4,8,4,2, 1,2,4,2,1, 42},       // Stucki
+    {5,3, 2,4,5,4,2, 0,2,3,2,0, 32},       // Sierra
+    {8,4, 2,4,8,4,2, 0,0,0,0,0, 32},       // Burkes
+};
+
+kernel void ditherDiffuse(texture2d<float, access::read> input [[texture(0)]],
+                          texture2d<float, access::write> grid [[texture(1)]],
+                          constant float4 *p [[buffer(0)]],
+                          uint2 tile [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
+    constant float4 *d = p + 18;
+    constant float *w = errorWeights[uint(d[0].x) - 5u];
+    const int tileWidth = 32, tileHeight = 16, halo = 6;
+    int2 origin = int2(tile) * int2(tileWidth, tileHeight) - halo;
+    int2 bounds = int2(grid.get_width(), grid.get_height());
+    float3 e0 = 0, e1 = 0, e2 = 0, e3 = 0, e4 = 0, e5 = 0, e6 = 0, e7 = 0;
+    // Parallel wavefront. At tick x + 3*y, all donors have completed and each SIMD lane owns a row.
+    // The upper/side halo warms up the same stencil across tile boundaries. See https://doi.org/10.1117/12.872616.
+    const int workWidth = tileWidth + 2 * halo, workHeight = tileHeight + halo;
+    for (int tick = 0; tick < workWidth + 3 * (workHeight - 1); ++tick) {
+        int x = tick - 3 * int(lane);
+        int2 pixel = origin + int2(x, lane);
+        float3 row1 = e4*w[2] + e3*w[3] + e2*w[4] + e1*w[5] + e0*w[6];
+        float3 row2 = e7*w[7] + e6*w[8] + e5*w[9] + e4*w[10] + e3*w[11];
+        float3 above1 = simd_shuffle_up(row1, 1);
+        float3 above2 = simd_shuffle_up(row2, 2);
+        float3 error = float3(0);
+        if (x >= 0 && x < workWidth && lane < workHeight && all(pixel >= 0) && all(pixel < bounds)) {
+            float3 influence = e0*w[0] + e1*w[1];
+            if (lane >= 1) influence += above1;
+            if (lane >= 2) influence += above2;
+            float3 signal = saturate(input.read(uint2(pixel)).rgb + influence * (d[0].z / w[12]));
+            float3 level = ditherQuantize(signal, d[0].y);
+            error = signal - level;
+            if (x >= halo && x < halo + tileWidth && lane >= halo) grid.write(float4(ditherColor(level, d), 1.0), uint2(pixel));
+        }
+        e7 = e6; e6 = e5; e5 = e4; e4 = e3; e3 = e2; e2 = e1; e1 = e0; e0 = error;
+    }
+}
+
+float3 ditherComposite(float3 original, texture2d<float, access::sample> grid, float2 uv, constant float4 *p) {
+    if (p[19].y <= 0.0) return original;
+    return mix(original, grid.sample(glyphSampler, uv).rgb, p[19].y);
+}
+
 kernel void asciiPrepare(texture2d<float, access::sample> source [[texture(0)]],
                          texture2d<float, access::sample> compressed [[texture(1)]],
-                         texture2d<float, access::write> cells [[texture(2)]],
+                         texture2d<float, access::sample> dither [[texture(2)]],
+                         texture2d<float, access::write> cells [[texture(3)]],
                          constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= cells.get_width() || gid.y >= cells.get_height()) return;
     float2 size = p[12].zw;
     float2 cell = float2(p[9].y, p[9].y * 1.5) * size.x / 1080.0;
     float2 center = (float2(gid) + 0.5) * cell / size;
-    float3 original = postSample(source, compressed, center, p, size);
+    float3 original = p[19].y > 0.0
+        ? ditherComposite(postAppearance(source, compressed, center, p, size), dither, center, p)
+        : postSample(source, compressed, center, p, size);
     float signal = clamp(luminance(original), 0.0, 1.0);
     if (p[10].x > 0.5) signal = 1.0 - signal;
     float l = clamp((signal - 0.5) * p[9].z + 0.5, 0.0, 1.0);
@@ -338,28 +477,17 @@ kernel void finish(texture2d<float, access::sample> source [[texture(0)]],
                    texture2d<float, access::sample> atlas [[texture(1)]],
                    texture2d<float, access::sample> compressed [[texture(2)]],
                    texture2d<float, access::sample> cells [[texture(3)]],
-                   texture2d<float, access::write> target [[texture(4)]],
+                   texture2d<float, access::sample> dither [[texture(4)]],
+                   texture2d<float, access::write> target [[texture(5)]],
                    constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
     float2 size = float2(target.get_width(), target.get_height());
     float2 uv = (float2(gid) + 0.5) / size;
     bool fullASCII = p[9].x > 0.5 && p[10].y >= 0.999;
     float3 c = float3(0);
-    if (!fullASCII) c = postSample(source, compressed, uv, p, size);
-    if (!fullASCII && p[7].x > 0.5) {
-        float n = fract(sin(dot(float2(gid), float2(12.9898, 78.233)) + p[8].z * 57.0) * 43758.5453) - 0.5;
-        c += n * p[7].y * 0.23;
-        float scanBand = step(0.5, fract((float(gid.y) + 0.5) * 1080.0 / size.x / 3.0));
-        c *= 1.0 - p[8].x * scanBand * 0.45;
-        if (p[8].y > 0.001) {
-            float cell = 7.0 * size.x / 1080.0;
-            float2 cellUV = (floor(float2(gid) / cell) + 0.5) * cell / size;
-            float l = clamp(luminance(postSample(source, compressed, cellUV, p, size)), 0.0, 1.0);
-            float radius = sqrt(l) * 0.7;
-            float d = length(fract(float2(gid) / cell) - 0.5);
-            float ink = 1.0 - smoothstep(radius - 0.06, radius + 0.06, d);
-            c = mix(c, float3(ink), p[8].y);
-        }
+    if (!fullASCII) {
+        if (p[19].y < 1.0) c = postAppearance(source, compressed, uv, p, size);
+        c = ditherComposite(c, dither, uv, p);
     }
     if (p[9].x > 0.5) {
         float2 cell = float2(p[9].y, p[9].y * 1.5) * size.x / 1080.0;
