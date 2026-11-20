@@ -79,7 +79,16 @@ enum EffectID: String, Codable, CaseIterable, Identifiable {
             .slider("halftone", "Халфтон", 0...1, 0),
             .slider("pixel", "Пикселизация", 1...48, 1, unit: "px")]
         case .dither: return DitherMode.parameters
-        case .ascii: return ASCIIMode.parameters
+        case .ascii: return [
+            .slider("cell", "Размер символов", 2...96, 12, unit: "px"),
+            .slider("contrast", "Контраст символов", 0.1...10, 1.2),
+            .choice("symbols", "Символы", ASCIISymbols.allCases.map(\.title)),
+            .choice("palette", "Палитра", ["Бумага", "Терминал", "Янтарь", "Цвет кадра", "Свой цвет", "Градиент"]),
+            .choice("invert", "Яркость", ["Обычная", "Инверсия"]),
+            .slider("mix", "Смешивание", 0...1, 1),
+            .slider("inkR", "", 0...1, 0.84), .slider("inkG", "", 0...1, 0.97), .slider("inkB", "", 0...1, 0.37),
+            .slider("ink2R", "", 0...1, 1), .slider("ink2G", "", 0...1, 0.3), .slider("ink2B", "", 0...1, 0.6),
+            .slider("paperR", "", 0...1, 0), .slider("paperG", "", 0...1, 0), .slider("paperB", "", 0...1, 0)]
         case .motion: return [
             .slider("shutter", "Угол затвора", 0...360, 180, unit: "°")]
         case .shakal: return [
@@ -171,68 +180,6 @@ enum ASCIISymbols: Int, CaseIterable {
     }
 }
 
-enum ASCIIPlacement: Int, CaseIterable {
-    case darkest, brightest, mostColorful
-    var title: String { ["Тёмные участки", "Светлые участки", "Самые цветные"][rawValue] }
-}
-
-enum ASCIIMode: Int, CaseIterable {
-    case ascii, blur, glow
-
-    var title: String { ["ASCII", "ASCII Blur", "ASCII Glow"][rawValue] }
-
-    private static let shared: [EffectParameter] = [
-        .choice("mode", "Режим", allCases.map(\.title)),
-        .choice("characterOn", "Где рисовать символы", ASCIIPlacement.allCases.map(\.title)),
-        .choice("symbols", "Символы", ASCIISymbols.allCases.map(\.title))
-    ]
-    static let parameters = shared + allCases.flatMap(\.specificParameters)
-    var editableParameters: [EffectParameter] { Self.shared + specificParameters }
-
-    private static let plainParameters: [EffectParameter] = [
-        .slider("cell", "Размер символов", 2...96, 12, unit: "px"),
-        .slider("contrast", "Контраст символов", 0.1...10, 1.2),
-        .choice("palette", "Палитра", ["Бумага", "Терминал", "Янтарь", "Цвет кадра", "Свой цвет", "Градиент"]),
-        .choice("invert", "Яркость", ["Обычная", "Инверсия"]),
-        .slider("mix", "Смешивание", 0...1, 1),
-        .slider("inkR", "", 0...1, 0.84), .slider("inkG", "", 0...1, 0.97), .slider("inkB", "", 0...1, 0.37),
-        .slider("ink2R", "", 0...1, 1), .slider("ink2G", "", 0...1, 0.3), .slider("ink2B", "", 0...1, 0.6),
-        .slider("paperR", "", 0...1, 0), .slider("paperG", "", 0...1, 0), .slider("paperB", "", 0...1, 0)
-    ]
-    private static let blurParameters: [EffectParameter] = [
-        .slider("blurCell", "Размер символов", 2...96, 6, unit: "px", step: 1),
-        .slider("blurCoverage", "Покрытие", 0...1, 1),
-        .slider("blurSoftness", "Мягкость краёв", 0...1, 1),
-        .slider("blurGap", "Зазор", 0...1, 0.2),
-        .slider("blurExposure", "Экспозиция", 0...2, 1),
-        .slider("blurScatter", "Разброс", 0...1, 0),
-        .slider("blurInk", "Непрозрачность символов", 0...1, 1),
-        .slider("blurPhoto", "Непрозрачность кадра", 0...1, 0.7),
-        .slider("blurBackground", "Размытие фона", 0...1, 0.2)
-    ]
-    private static let glowParameters: [EffectParameter] = [
-        .choice("glowPalette", "Цвет", ["Один цвет", "Градиент"]),
-        .slider("glowCell", "Размер символов", 2...96, 16, unit: "px", step: 1),
-        .slider("glowContrast", "Контраст", -1...1, 0, unit: "", step: 0.01),
-        .slider("glowGap", "Зазор", 0...1, 0.2),
-        .slider("glowExposure", "Экспозиция", 0...2, 1.2),
-        .slider("glowStrength", "Свечение", 0...1, 0.6),
-        .slider("glowGhost", "Фоновая сетка", 0...1, 0.5),
-        .slider("glowPhoto", "Непрозрачность кадра", 0...1, 0.7),
-        .slider("glowMix", "Смешивание", 0...1, 1),
-        .slider("glowInkR", "", 0...1, 0.41), .slider("glowInkG", "", 0...1, 0.96), .slider("glowInkB", "", 0...1, 0.77),
-        .slider("glowInk2R", "", 0...1, 0.94), .slider("glowInk2G", "", 0...1, 0.37), .slider("glowInk2B", "", 0...1, 0.77)
-    ]
-
-    private var specificParameters: [EffectParameter] {
-        switch self {
-        case .ascii: return Self.plainParameters
-        case .blur: return Self.blurParameters
-        case .glow: return Self.glowParameters
-        }
-    }
-}
-
 struct EffectParameter: Identifiable {
     let id: String
     let title: String
@@ -251,7 +198,7 @@ struct EffectParameter: Identifiable {
     func formatted(_ value: Float) -> String {
         if !choices.isEmpty { return choices[min(choices.count - 1, max(0, Int(value)))] }
         if unit == "%" { return String(format: "%.0f%%", value * 100) }
-        if unit.isEmpty { return String(format: (step ?? 1) < 1 ? "%.2f" : "%.0f", value) }
+        if unit.isEmpty { return String(format: "%.0f", value) }
         if unit == "°" { return String(format: "%.0f°", value) }
         if unit == "×" { return String(format: "%.1f×", value) }
         return String(format: unit == "px" ? "%.0f %@" : "%.1f %@", value, unit)
@@ -276,34 +223,17 @@ struct EffectSettings: Codable, Equatable {
         return min(parameter.range.upperBound, max(parameter.range.lowerBound, value))
     }
     mutating func set(_ effect: EffectID, _ key: String, _ value: Float) {
-        var state = effects[effect] ?? Self.defaults(for: effect)
+        var state = effects[effect] ?? EffectState()
         if effect == .ascii && key == "symbols" { state.values["atlasVersion"] = 1 }
         state.values[key] = value
         effects[effect] = state
     }
     mutating func toggle(_ effect: EffectID) {
-        var state = effects[effect] ?? Self.defaults(for: effect)
+        var state = effects[effect] ?? EffectState()
         state.enabled.toggle()
         effects[effect] = state
     }
-
-    mutating func reset(_ effect: EffectID) {
-        var state = Self.defaults(for: effect)
-        state.enabled = enabled(effect)
-        effects[effect] = state
-    }
-
-    private static func defaults(for effect: EffectID) -> EffectState {
-        EffectState(values: effect == .ascii ? ["characterOn": 0, "atlasVersion": 1] : [:])
-    }
-
-    var asciiMode: ASCIIMode { ASCIIMode(rawValue: Int(value(.ascii, "mode"))) ?? .ascii }
-    var asciiUsesLegacyPlacement: Bool {
-        asciiMode == .ascii && effects[.ascii].map { $0.values["characterOn"] == nil } == true
-    }
-    var asciiUsesLegacyGlyphs: Bool {
-        asciiMode == .ascii && effects[.ascii].map { $0.values["atlasVersion"] == nil } == true
-    }
+    var asciiUsesLegacyGlyphs: Bool { effects[.ascii]?.values["atlasVersion"] == nil }
     var wantsDepth: Bool { enabled(.dof) && value(.dof, "mode") >= 0.5 }
     var shutterAngle: Float { enabled(.motion) ? value(.motion, "shutter") : 0 }
     var activeCount: Int { EffectID.allCases.filter { enabled($0) }.count }
@@ -320,7 +250,8 @@ struct LookPreset: Codable, Identifiable {
     let settings: EffectSettings
     static var builtIns: [Self] {
         var terminal = EffectSettings()
-        terminal.effects[.ascii] = EffectState(enabled: true, values: ["palette": 1])
+        terminal.toggle(.ascii)
+        terminal.set(.ascii, "palette", 1)
         var film = EffectSettings()
         film.toggle(.post)
         film.toggle(.bloom)

@@ -34,7 +34,7 @@ enum PipelineVerification {
                 record("PASS Apple5 threadgroup fallback / same Floyd–Steinberg stencil")
             }
             try verifyASCIIShadows(renderer: renderer, record: record)
-            try await verifyASCIIModes(renderer: renderer, image: image, baseline: baselineBytes, record: record)
+            try verifyASCIISymbols(renderer: renderer, image: image, record: record)
             try verifyCameraShutter(record: record)
             record(try await CameraService.verifyShutterHardware())
             try await verifyDatamosh(renderer: renderer, record: record)
@@ -83,21 +83,11 @@ enum PipelineVerification {
                 record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: dither, paced: false).run())
                 record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: dither, paced: true).run())
             }
-            for mode in [ASCIIMode.blur, .glow] {
-                var settings = EffectSettings()
-                settings.toggle(.ascii)
-                settings.set(.ascii, "mode", Float(mode.rawValue))
-                record("BENCH \(mode.title) / defaults / 1080×1920")
-                record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: settings, paced: true).run())
-            }
-            var combined = dither
-            combined.toggle(.ascii)
-            combined.set(.ascii, "mode", Float(ASCIIMode.glow.rawValue))
-            record("BENCH Dither JJN + ASCII Glow / 1080×1920")
-            record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: combined, paced: true, fps: 60, seconds: 4).run())
+            record("BENCH Dither JJN / RGB / 1 px / 1080×1920")
+            record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: dither, paced: true, fps: 60, seconds: 4).run())
             let uhd = benchmarkImage.transformed(by: CGAffineTransform(scaleX: 2, y: 2))
-            record("BENCH Dither JJN + ASCII Glow / 2160×3840")
-            record(try await RenderBenchmark(renderer: renderer, image: uhd, settings: combined, paced: true, seconds: 4).run())
+            record("BENCH Dither JJN / RGB / 1 px / 2160×3840")
+            record(try await RenderBenchmark(renderer: renderer, image: uhd, settings: dither, paced: true, seconds: 4).run())
             record("COMPLETE")
         } catch { record("FAIL \(error.localizedDescription)") }
         let report = lines.joined(separator: "\n")
@@ -181,7 +171,8 @@ enum PipelineVerification {
         let image = CIImage(bitmapData: Data(pixels), bytesPerRow: width * 4, size: CGSize(width: width, height: height),
                             format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
         var settings = EffectSettings()
-        settings.effects[.ascii] = EffectState(enabled: true, values: ["cell": 6, "contrast": 3, "palette": 4])
+        settings.toggle(.ascii)
+        settings.set(.ascii, "cell", 6); settings.set(.ascii, "contrast", 3); settings.set(.ascii, "palette", 4)
         let output = bytes(try renderer.render(image, depth: nil, settings: settings, time: 1))
         let ink = levels.indices.map { band in
             (0..<height).reduce(0) { total, y in
@@ -197,62 +188,20 @@ enum PipelineVerification {
         record("PASS ASCII 6 px/300% / black background and shadow glyphs: \(ink)")
     }
 
-    private static func verifyASCIIModes(renderer: FrameRenderer, image: CIImage, baseline: [UInt8],
-                                         record: (String) -> Void) async throws {
+    private static func verifyASCIISymbols(renderer: FrameRenderer, image: CIImage, record: (String) -> Void) throws {
         var settings = EffectSettings()
         settings.toggle(.ascii)
-        settings.set(.ascii, "mode", Float(ASCIIMode.blur.rawValue))
-        settings.set(.ascii, "blurInk", 0)
-        settings.set(.ascii, "blurPhoto", 1)
-        settings.set(.ascii, "blurBackground", 0)
-        func render(_ settings: EffectSettings) throws -> [UInt8] {
-            bytes(try renderer.render(image, depth: nil, settings: settings, time: 0))
-        }
-        guard try render(settings) == baseline else { throw TrenchesError.message("ASCII Blur меняет исходник при отключённых слоях") }
-        settings.set(.ascii, "blurBackground", 1)
-        guard try render(settings) != baseline else { throw TrenchesError.message("ASCII Blur не применил размытие фона") }
-
-        settings.set(.ascii, "mode", Float(ASCIIMode.glow.rawValue))
-        settings.set(.ascii, "glowPhoto", 0)
-        settings.set(.ascii, "glowGhost", 0)
-        settings.set(.ascii, "glowStrength", 0)
+        settings.set(.ascii, "cell", 16)
         var patterns: Set<Data> = []
         for symbols in ASCIISymbols.allCases {
             settings.set(.ascii, "symbols", Float(symbols.rawValue))
-            let result = try render(settings)
+            let result = bytes(try renderer.render(image, depth: nil, settings: settings, time: 0))
             guard stride(from: 1, to: result.count, by: 4).contains(where: { result[$0] > 10 }),
                   patterns.insert(Data(result)).inserted else {
                 throw TrenchesError.message("ASCII пропустил или повторил набор \(symbols.title)")
             }
         }
-        var placements: Set<Data> = []
-        for placement in ASCIIPlacement.allCases {
-            settings.set(.ascii, "characterOn", Float(placement.rawValue))
-            guard try placements.insert(Data(render(settings))).inserted else {
-                throw TrenchesError.message("Область ASCII \(placement.title) не меняет рисунок")
-            }
-        }
-        let symbolsOnly = try render(settings)
-        settings.set(.ascii, "glowStrength", 1)
-        guard try render(settings) != symbolsOnly else { throw TrenchesError.message("ASCII Glow не рисует ореол") }
-        settings.set(.ascii, "glowStrength", 0)
-        settings.set(.ascii, "glowGhost", 1)
-        guard try render(settings) != symbolsOnly else { throw TrenchesError.message("ASCII Glow не рисует фоновую сетку") }
-        settings.set(.ascii, "glowMix", 0)
-        guard try render(settings) == baseline else { throw TrenchesError.message("ASCII Glow меняет исходник при нулевом смешивании") }
-
-        settings.set(.ascii, "glowMix", 1)
-        settings.toggle(.dither)
-        settings.set(.dither, "mode", Float(DitherMode.blueNoise.rawValue))
-        let snapshot = settings
-        let expected = try render(snapshot)
-        let asyncFrame: CVPixelBuffer = try await withCheckedThrowingContinuation { continuation in
-            do {
-                try renderer.renderAsync(image, depth: nil, settings: snapshot, time: 0) { continuation.resume(with: $0) }
-            } catch { continuation.resume(throwing: error) }
-        }
-        guard bytes(asyncFrame) == expected else { throw TrenchesError.message("Фото и live-кадр дают разные пиксели") }
-        record("PASS ASCII 11 packs / 3 placements / independent blur, halo and ghost grid / still and live render parity")
+        record("PASS 11 ASCII symbol packs")
     }
 
     private static func verifyCameraShutter(record: (String) -> Void) throws {

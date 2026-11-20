@@ -60,7 +60,7 @@ TRENCHES_VERIFY=1 bash Trenches/scripts/build.sh --sign -c debug
 bash Trenches/scripts/install.sh
 ```
 
-Открой trenches вручную. Диагностика проверяет Metal, выдержку камеры, Dither, наборы и слои ASCII, Datamosh и JPEG/MOV. Тестовая запись со звуком включает прогоны 1080p/30, 1080p/60 и 4K/30. После COMPLETE или FAIL выполни команду.
+Открой trenches вручную. Диагностика проверяет Metal, выдержку камеры, Dither, наборы ASCII, Datamosh и JPEG/MOV. Тестовая запись со звуком включает прогоны 1080p/30, 1080p/60 и 4K/30. После COMPLETE или FAIL выполни команду.
 
 ```bash
 python3 Trenches/scripts/read-verification.py

@@ -18,8 +18,6 @@ final class FrameRenderer {
     private let grade: MTLComputePipelineState
     private let finish: MTLComputePipelineState
     private let asciiPrepare: MTLComputePipelineState
-    private let asciiBackdrop: MTLComputePipelineState
-    private let asciiEmission: MTLComputePipelineState
     private let jpegDegrade: MTLComputePipelineState
     private let macroblock: MTLComputePipelineState
     private let brightPass: MTLComputePipelineState
@@ -38,8 +36,6 @@ final class FrameRenderer {
     private var blurred: MTLTexture?
     private var intermediate: MTLTexture?
     private var asciiCells: MTLTexture?
-    private var asciiSoftInput: MTLTexture?
-    private var asciiSoftOutput: MTLTexture?
     private var compressed: MTLTexture?
     private var blockOutput: MTLTexture?
     private var highlights: MTLTexture?
@@ -64,15 +60,12 @@ final class FrameRenderer {
         if ditherUsesSIMD { options.preprocessorMacros = ["TRENCHES_SIMD_DIFFUSION": NSNumber(value: 1)] }
         let library = try device.makeLibrary(source: String(contentsOf: url, encoding: .utf8), options: options)
         guard let gradeFunction = library.makeFunction(name: "grade"), let finishFunction = library.makeFunction(name: "finish"),
-              let asciiFunction = library.makeFunction(name: "asciiPrepare"), let jpegFunction = library.makeFunction(name: "jpegDegrade"),
-              let backdrop = library.makeFunction(name: "asciiBackdrop"), let emission = library.makeFunction(name: "asciiEmission") else {
+              let asciiFunction = library.makeFunction(name: "asciiPrepare"), let jpegFunction = library.makeFunction(name: "jpegDegrade") else {
             throw TrenchesError.message("Не найдены функции обработки Metal.")
         }
         grade = try device.makeComputePipelineState(function: gradeFunction)
         finish = try device.makeComputePipelineState(function: finishFunction)
         asciiPrepare = try device.makeComputePipelineState(function: asciiFunction)
-        asciiBackdrop = try device.makeComputePipelineState(function: backdrop)
-        asciiEmission = try device.makeComputePipelineState(function: emission)
         jpegDegrade = try device.makeComputePipelineState(function: jpegFunction)
         guard let blocks = library.makeFunction(name: "macroblockCorrupt") else { throw TrenchesError.message("Не найден Macroblock.") }
         macroblock = try device.makeComputePipelineState(function: blocks)
@@ -101,7 +94,7 @@ final class FrameRenderer {
     private func prepare(width: Int, height: Int) throws {
         guard size != CGSize(width: width, height: height) else { return }
         pool = nil; source = nil; blurred = nil; intermediate = nil; asciiCells = nil; compressed = nil
-        asciiSoftInput = nil; asciiSoftOutput = nil; ditherGrid = nil; ditherSignal = nil
+        ditherGrid = nil; ditherSignal = nil
         size = .zero
         CVMetalTextureCacheFlush(cache, 0)
         let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA, kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height, kCVPixelBufferMetalCompatibilityKey as String: true, kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
@@ -214,7 +207,7 @@ final class FrameRenderer {
                 depthTexture = CVMetalTextureGetTexture(depthReference)
             }
         }
-        var p = [SIMD4<Float>](repeating: .zero, count: 25)
+        var p = [SIMD4<Float>](repeating: .zero, count: 22)
         func on(_ id: EffectID) -> Float { settings.enabled(id) ? 1 : 0 }
         p[0] = SIMD4(on(.dof), settings.value(.dof, "mode"), depthTexture == nil ? 0 : 1, 0)
         p[1] = SIMD4(settings.value(.dof, "focus"), settings.value(.dof, "range"), settings.value(.dof, "radius"), 0)
@@ -232,7 +225,14 @@ final class FrameRenderer {
         p[6] = SIMD4(settings.value(.color, "contrast"), settings.value(.color, "gamma"), 0, 0)
         p[7] = SIMD4(on(.post), settings.value(.post, "grain"), settings.value(.post, "vignette"), settings.value(.post, "rgb"))
         p[8] = SIMD4(settings.value(.post, "scan"), settings.value(.post, "halftone"), Float(time.truncatingRemainder(dividingBy: 3600)), settings.value(.post, "pixel"))
-        configureASCII(settings, parameters: &p)
+        p[9] = SIMD4(on(.ascii), settings.value(.ascii, "cell"), settings.value(.ascii, "contrast"), settings.value(.ascii, "palette"))
+        p[10] = SIMD4(settings.value(.ascii, "invert"), settings.value(.ascii, "mix"), 0, 0)
+        let symbols = ASCIISymbols(rawValue: Int(settings.value(.ascii, "symbols"))) ?? .standard
+        let row = asciiAtlas.row(for: symbols, legacy: settings.asciiUsesLegacyGlyphs)
+        p[10].z = row.index; p[10].w = row.count
+        p[13] = SIMD4(settings.value(.ascii, "inkR"), settings.value(.ascii, "inkG"), settings.value(.ascii, "inkB"), 0)
+        p[14] = SIMD4(settings.value(.ascii, "ink2R"), settings.value(.ascii, "ink2G"), settings.value(.ascii, "ink2B"), 0)
+        p[15] = SIMD4(settings.value(.ascii, "paperR"), settings.value(.ascii, "paperG"), settings.value(.ascii, "paperB"), 0)
         p[11] = SIMD4(on(.shakal), settings.value(.shakal, "quality"), settings.value(.shakal, "scale"), settings.value(.shakal, "chroma"))
         p[12] = SIMD4(settings.value(.shakal, "sampling"), settings.value(.shakal, "mix"), Float(width), Float(height))
         p[16] = SIMD4(settings.value(.macroblock, "block") < 0.5 ? 8 : 16, settings.value(.macroblock, "amount"), settings.value(.macroblock, "fraction"), settings.value(.macroblock, "seed").rounded())
@@ -282,78 +282,18 @@ final class FrameRenderer {
                 try Self.encode(command, pipeline: ditherThreshold, textures: [graded, compressedTexture, blueNoise, dither], parameters: p, width: w, height: h)
             }
         }
-        var cells = atlas, backdrop = atlas, halo = atlas
-        if p[9].x > 0 {
-            let cell = p[9].y * Float(width) / 1080
+        var cells = atlas
+        if settings.enabled(.ascii) {
+            let cell = settings.value(.ascii, "cell") * Float(width) / 1080
             let w = max(1, Int(ceil(Float(width) / cell)))
             let h = max(1, Int(ceil(Float(height) / (cell * 1.5))))
             cells = try scratch(&asciiCells, width: w, height: h)
             try Self.encode(command, pipeline: asciiPrepare, textures: [graded, compressedTexture, dither, cells], parameters: p, width: w, height: h)
-            if settings.asciiMode == .blur, p[24].y > 0 {
-                backdrop = try softenASCII(command, pipeline: asciiBackdrop, textures: [graded, compressedTexture, dither],
-                                          parameters: p, width: width, height: height,
-                                          sigmaInReferencePixels: 86 * p[24].y)
-            } else if settings.asciiMode == .glow, p[24].z > 0 {
-                halo = try softenASCII(command, pipeline: asciiEmission, textures: [atlas, cells],
-                                       parameters: p, width: width, height: height,
-                                       sigmaInReferencePixels: max(4, min(28, p[9].y * 0.54)))
-            }
         }
-        try Self.encode(command, pipeline: finish, textures: [graded, atlas, compressedTexture, cells, dither, backdrop, halo, outputTexture], parameters: p, width: width, height: height)
+        try Self.encode(command, pipeline: finish, textures: [graded, atlas, compressedTexture, cells, dither, outputTexture], parameters: p, width: width, height: height)
         if let depthReference { resources.append(depthReference) }
         if let convertedDepth { resources.append(convertedDepth) }
         return PendingFrame(output: output, command: command, resources: resources)
-    }
-
-    private func configureASCII(_ settings: EffectSettings, parameters p: inout [SIMD4<Float>]) {
-        guard settings.enabled(.ascii) else { return }
-        func value(_ key: String) -> Float { settings.value(.ascii, key) }
-        func color(_ prefix: String) -> SIMD4<Float> { SIMD4(value(prefix + "R"), value(prefix + "G"), value(prefix + "B"), 0) }
-        let mode = settings.asciiMode
-        let symbols = ASCIISymbols(rawValue: Int(value("symbols"))) ?? .standard
-        let row = asciiAtlas.row(for: symbols, legacy: settings.asciiUsesLegacyGlyphs)
-        p[10].z = row.index
-        p[10].w = row.count
-        p[22].x = Float(mode.rawValue)
-        p[22].y = settings.asciiUsesLegacyPlacement ? -1 : value("characterOn")
-        switch mode {
-        case .ascii:
-            p[9] = SIMD4(value("mix") > 0 ? 1 : 0, value("cell"), value("contrast"), value("palette"))
-            p[10].x = value("invert")
-            p[10].y = value("mix")
-            p[13] = color("ink")
-            p[14] = color("ink2")
-            p[15] = color("paper")
-        case .blur:
-            p[9] = SIMD4(1, value("blurCell"), 0, 0)
-            p[22].z = value("blurExposure")
-            p[22].w = value("blurGap")
-            p[23] = SIMD4(value("blurCoverage"), value("blurSoftness"), value("blurScatter"), value("blurInk"))
-            let photo = value("blurPhoto")
-            p[24] = SIMD4(photo, photo > 0 ? value("blurBackground") : 0, 0, 0)
-        case .glow:
-            p[9] = SIMD4(value("glowMix") > 0 ? 1 : 0, value("glowCell"), value("glowContrast"), value("glowPalette"))
-            p[10].y = value("glowMix")
-            p[13] = color("glowInk")
-            p[14] = color("glowInk2")
-            p[22].z = value("glowExposure")
-            p[22].w = value("glowGap")
-            p[23].x = 1
-            p[24] = SIMD4(value("glowPhoto"), 0, value("glowStrength"), value("glowGhost"))
-        }
-    }
-
-    private func softenASCII(_ command: MTLCommandBuffer, pipeline: MTLComputePipelineState, textures: [MTLTexture],
-                             parameters: [SIMD4<Float>], width: Int, height: Int, sigmaInReferencePixels: Float) throws -> MTLTexture {
-        let w = max(1, width / 4), h = max(1, height / 4)
-        let input = try scratch(&asciiSoftInput, width: w, height: h)
-        let result = try scratch(&asciiSoftOutput, width: w, height: h)
-        try Self.encode(command, pipeline: pipeline, textures: textures + [input], parameters: parameters, width: w, height: h)
-        let sigma = max(0.5, sigmaInReferencePixels * Float(w) / 1080)
-        let blur = MPSImageGaussianBlur(device: device, sigma: sigma)
-        blur.edgeMode = .clamp
-        blur.encode(commandBuffer: command, sourceTexture: input, destinationTexture: result)
-        return result
     }
 
     private func encodeDiffusion(_ command: MTLCommandBuffer, input: MTLTexture, output: MTLTexture,
