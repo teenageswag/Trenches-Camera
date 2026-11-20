@@ -413,7 +413,7 @@ constant float errorWeights[6][13] = {
 kernel void ditherDiffuse(texture2d<float, access::read> input [[texture(0)]],
                           texture2d<float, access::write> grid [[texture(1)]],
                           constant float4 *p [[buffer(0)]],
-                          uint2 tile [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
+                          uint2 tile [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]]) {
     constant float4 *d = p + 18;
     constant float *w = errorWeights[uint(d[0].x) - 5u];
     const int tileWidth = 32, tileHeight = 16, halo = 6;
@@ -423,13 +423,31 @@ kernel void ditherDiffuse(texture2d<float, access::read> input [[texture(0)]],
     // Parallel wavefront. At tick x + 3*y, all donors have completed and each SIMD lane owns a row.
     // The upper/side halo warms up the same stencil across tile boundaries. See https://doi.org/10.1117/12.872616.
     const int workWidth = tileWidth + 2 * halo, workHeight = tileHeight + halo;
+#if !defined(TRENCHES_SIMD_DIFFUSION)
+    // Apple5 GPUs lack SIMD-scoped permute. Alternating banks dispatch the same stencil with one group barrier per tick.
+    // https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf
+    threadgroup float3 wavefront[2][2][workHeight];
+#endif
     for (int tick = 0; tick < workWidth + 3 * (workHeight - 1); ++tick) {
         int x = tick - 3 * int(lane);
         int2 pixel = origin + int2(x, lane);
-        float3 row1 = e4*w[2] + e3*w[3] + e2*w[4] + e1*w[5] + e0*w[6];
-        float3 row2 = e7*w[7] + e6*w[8] + e5*w[9] + e4*w[10] + e3*w[11];
-        float3 above1 = simd_shuffle_up(row1, 1);
-        float3 above2 = simd_shuffle_up(row2, 2);
+        // A weight for writing to x + offset is collected from x - offset.
+        float3 row1 = e0*w[2] + e1*w[3] + e2*w[4] + e3*w[5] + e4*w[6];
+        float3 row2 = e3*w[7] + e4*w[8] + e5*w[9] + e6*w[10] + e7*w[11];
+        float3 above1, above2;
+#if defined(TRENCHES_SIMD_DIFFUSION)
+        above1 = simd_shuffle_up(row1, 1);
+        above2 = simd_shuffle_up(row2, 2);
+#else
+        uint bank = uint(tick) & 1u;
+        if (lane < workHeight) {
+            wavefront[bank][0][lane] = row1;
+            wavefront[bank][1][lane] = row2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        above1 = lane >= 1 && lane < workHeight ? wavefront[bank][0][lane - 1] : float3(0);
+        above2 = lane >= 2 && lane < workHeight ? wavefront[bank][1][lane - 2] : float3(0);
+#endif
         float3 error = float3(0);
         if (x >= 0 && x < workWidth && lane < workHeight && all(pixel >= 0) && all(pixel < bounds)) {
             float3 influence = e0*w[0] + e1*w[1];
@@ -449,6 +467,14 @@ float3 ditherComposite(float3 original, texture2d<float, access::sample> grid, f
     return mix(original, grid.sample(glyphSampler, uv).rgb, p[19].y);
 }
 
+// Soft glyphs, a blurred image layer, and emissive color are inspired by Ditther's ASCII effects:
+// https://app.ditther.com/ and https://ditther.com/effects/ascii/
+float asciiArea(float3 color, float placement) {
+    if (placement > 1.5) return max(color.r, max(color.g, color.b)) - min(color.r, min(color.g, color.b));
+    float l = saturate(luminance(color));
+    return placement > 0.5 ? l : 1.0 - l;
+}
+
 kernel void asciiPrepare(texture2d<float, access::sample> source [[texture(0)]],
                          texture2d<float, access::sample> compressed [[texture(1)]],
                          texture2d<float, access::sample> dither [[texture(2)]],
@@ -458,19 +484,96 @@ kernel void asciiPrepare(texture2d<float, access::sample> source [[texture(0)]],
     float2 size = p[12].zw;
     float2 cell = float2(p[9].y, p[9].y * 1.5) * size.x / 1080.0;
     float2 center = (float2(gid) + 0.5) * cell / size;
-    float3 original = p[19].y > 0.0
-        ? ditherComposite(postAppearance(source, compressed, center, p, size), dither, center, p)
-        : postSample(source, compressed, center, p, size);
-    float signal = clamp(luminance(original), 0.0, 1.0);
-    if (p[10].x > 0.5) signal = 1.0 - signal;
-    float l = clamp((signal - 0.5) * p[9].z + 0.5, 0.0, 1.0);
+    bool plain = p[22].x < 0.5;
+    float3 color = plain && p[19].y <= 0.0
+        ? postSample(source, compressed, center, p, size)
+        : ditherComposite(postAppearance(source, compressed, center, p, size), dither, center, p);
     float count = p[10].w;
-    float glyph = min(floor(l * count), count - 1.0);
-    // Keep a few sparse glyphs in the toe where high contrast would turn every shadow into a space.
-    float toe = clamp((signal - 3.0 / 255.0) / (0.40 - 3.0 / 255.0), 0.0, 1.0);
-    float shadowGlyph = ceil(sqrt(toe) * clamp(floor(count / 3.0), 1.0, 3.0));
-    glyph = max(glyph, shadowGlyph);
-    cells.write(float4(original, glyph / 255.0), gid);
+    float glyph;
+    if (plain) {
+        float signal = saturate(luminance(color));
+        if (p[10].x > 0.5) signal = 1.0 - signal;
+        float l = saturate((signal - 0.5) * p[9].z + 0.5);
+        glyph = min(floor(l * count), count - 1.0);
+        // Preserve some sparse glyphs in the shadows even when contrast is high.
+        float toe = saturate((signal - 3.0 / 255.0) / (0.40 - 3.0 / 255.0));
+        float shadowGlyph = ceil(sqrt(toe) * clamp(floor(count / 3.0), 1.0, 3.0));
+        glyph = max(glyph, shadowGlyph);
+    } else {
+        float signal = asciiArea(color, p[22].y);
+        signal = saturate(((signal - 0.5) * (1.0 + p[9].z) + 0.5) * p[22].z);
+        glyph = floor(signal * (count - 1.0) + 0.5);
+    }
+    cells.write(float4(saturate(color), glyph / 255.0), gid);
+}
+
+float4 asciiCell(texture2d<float, access::sample> cells, float2 position) {
+    return cells.sample(glyphSampler, (floor(position) + 0.5) / float2(cells.get_width(), cells.get_height()));
+}
+
+float asciiGlyphMask(texture2d<float, access::sample> atlas, float2 local, float glyph, float row,
+                     float footprint, float softness) {
+    if (any(local < 0.0) || any(local > 1.0)) return 0.0;
+    const float2 glyphSize = float2(32, 48);
+    // Every cell of the atlas is aligned through mip 4.
+    float lod = clamp(log2(glyphSize.x / max(footprint, 0.1)) + softness, 0.0, 4.0);
+    float2 inset = 0.5 * exp2(ceil(lod)) / glyphSize;
+    float2 atlasPixel = (float2(glyph, row) + clamp(local, inset, 1.0 - inset)) * glyphSize;
+    return atlas.sample(atlasSampler, atlasPixel / float2(atlas.get_width(), atlas.get_height()), level(lod)).r;
+}
+
+float3 asciiClassicInk(float3 original, float glyph, constant float4 *p) {
+    if (p[9].w > 4.5) return mix(p[13].rgb, p[14].rgb, glyph / max(1.0, p[10].w - 1.0));
+    if (p[9].w > 3.5) return p[13].rgb;
+    if (p[9].w > 2.5) return original;
+    if (p[9].w > 1.5) return float3(1.0, 0.62, 0.19);
+    if (p[9].w > 0.5) return float3(0.53, 1.0, 0.43);
+    return float3(0.91, 0.90, 0.84);
+}
+
+float2 asciiLocal(float2 position, constant float4 *p) {
+    float2 local = fract(position) - 0.5;
+    if (p[23].z > 0.0) {
+        uint hash = blockHash(uint2(floor(position)), 0, 63);
+        float2 jitter = float2(blockRandom(hash), blockRandom(hash * 1664525u + 1013904223u)) - 0.5;
+        local -= jitter * (0.42 * p[23].z);
+    }
+    return local / (1.0 - 0.72 * p[22].w) + 0.5;
+}
+
+float asciiCoverage(float3 color, constant float4 *p) {
+    float coverage = p[23].x;
+    if (coverage <= 0.0) return 0.0;
+    float threshold = 1.0 - coverage;
+    return smoothstep(max(0.0, threshold - 0.08), min(1.0, threshold + 0.30), asciiArea(color, p[22].y));
+}
+
+float3 asciiGlowInk(float glyph, constant float4 *p) {
+    return p[9].w > 0.5 ? mix(p[13].rgb, p[14].rgb, glyph / max(1.0, p[10].w - 1.0)) : p[13].rgb;
+}
+
+kernel void asciiBackdrop(texture2d<float, access::sample> source [[texture(0)]],
+                          texture2d<float, access::sample> compressed [[texture(1)]],
+                          texture2d<float, access::sample> dither [[texture(2)]],
+                          texture2d<float, access::write> target [[texture(3)]],
+                          constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 uv = (float2(gid) + 0.5) / float2(target.get_width(), target.get_height());
+    target.write(float4(ditherComposite(postAppearance(source, compressed, uv, p, p[12].zw), dither, uv, p), 1.0), gid);
+}
+
+kernel void asciiEmission(texture2d<float, access::sample> atlas [[texture(0)]],
+                          texture2d<float, access::sample> cells [[texture(1)]],
+                          texture2d<float, access::write> target [[texture(2)]],
+                          constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
+    float2 size = float2(target.get_width(), target.get_height());
+    float2 position = (float2(gid) + 0.5) / size * p[12].zw / (p[9].y * p[12].z / 1080.0 * float2(1.0, 1.5));
+    float4 value = asciiCell(cells, position);
+    float glyph = round(value.a * 255.0);
+    float footprint = p[9].y * size.x / 1080.0 * (1.0 - 0.72 * p[22].w);
+    float mask = asciiGlyphMask(atlas, asciiLocal(position, p), glyph, p[10].z, footprint, 0.3);
+    target.write(float4(asciiGlowInk(glyph, p) * mask * asciiCoverage(value.rgb, p), 1.0), gid);
 }
 
 kernel void finish(texture2d<float, access::sample> source [[texture(0)]],
@@ -478,42 +581,57 @@ kernel void finish(texture2d<float, access::sample> source [[texture(0)]],
                    texture2d<float, access::sample> compressed [[texture(2)]],
                    texture2d<float, access::sample> cells [[texture(3)]],
                    texture2d<float, access::sample> dither [[texture(4)]],
-                   texture2d<float, access::write> target [[texture(5)]],
+                   texture2d<float, access::sample> backdrop [[texture(5)]],
+                   texture2d<float, access::sample> halo [[texture(6)]],
+                   texture2d<float, access::write> target [[texture(7)]],
                    constant float4 *p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= target.get_width() || gid.y >= target.get_height()) return;
     float2 size = float2(target.get_width(), target.get_height());
     float2 uv = (float2(gid) + 0.5) / size;
-    bool fullASCII = p[9].x > 0.5 && p[10].y >= 0.999;
+    bool hasASCII = p[9].x > 0.5;
+    int mode = int(p[22].x);
+    bool fullASCII = hasASCII && mode == 0 && p[10].y >= 0.999;
+    bool blurredBackdrop = hasASCII && mode == 1 && p[24].y > 0.0;
     float3 c = float3(0);
-    if (!fullASCII) {
+    if (blurredBackdrop) c = backdrop.sample(linearSampler, uv).rgb;
+    else if (!fullASCII && !(hasASCII && mode == 1 && p[24].x <= 0.0)) {
         if (p[19].y < 1.0) c = postAppearance(source, compressed, uv, p, size);
         c = ditherComposite(c, dither, uv, p);
     }
-    if (p[9].x > 0.5) {
+    if (hasASCII) {
         float2 cell = float2(p[9].y, p[9].y * 1.5) * size.x / 1080.0;
         float2 position = (float2(gid) + 0.5) / cell;
-        float2 cellUV = (floor(position) + 0.5) / float2(cells.get_width(), cells.get_height());
-        float4 cellValue = cells.sample(glyphSampler, cellUV);
-        float3 original = cellValue.rgb;
-        float glyph = round(cellValue.a * 255.0);
-        float2 local = fract(position);
-        const float2 glyphSize = float2(32, 48);
-        // At 6 px one texel read can miss a thin stroke. Up to level 4 the atlas tiles are mip-aligned.
-        float lod = clamp(log2(glyphSize.x / cell.x), 0.0, 4.0);
-        float2 inset = 0.5 * exp2(ceil(lod)) / glyphSize;
-        float2 atlasPixel = (float2(glyph, p[10].z) + clamp(local, inset, 1.0 - inset)) * glyphSize;
-        float2 atlasUV = atlasPixel / float2(atlas.get_width(), atlas.get_height());
-        float mask = atlas.sample(atlasSampler, atlasUV, level(lod)).r;
-        float3 ink = float3(0.91, 0.90, 0.84);
-        if (p[9].w > 4.5) ink = mix(p[13].rgb, p[14].rgb, glyph / max(1.0, p[10].w - 1.0));
-        else if (p[9].w > 3.5) ink = p[13].rgb;
-        else if (p[9].w > 2.5) ink = original;
-        else if (p[9].w > 1.5) ink = float3(1.0, 0.62, 0.19);
-        else if (p[9].w > 0.5) ink = float3(0.53, 1.0, 0.43);
-        float3 ascii = mix(p[15].rgb, ink, mask);
-        c = fullASCII ? ascii : mix(c, ascii, p[10].y);
+        float4 value = asciiCell(cells, position);
+        float glyph = round(value.a * 255.0);
+        if (mode == 0) {
+            float mask = asciiGlyphMask(atlas, fract(position), glyph, p[10].z, cell.x, 0.0);
+            if (p[22].y >= 0.0) mask *= smoothstep(0.02, 0.36, asciiArea(value.rgb, p[22].y));
+            float3 ascii = mix(p[15].rgb, asciiClassicInk(value.rgb, glyph, p), mask);
+            c = fullASCII ? ascii : mix(c, ascii, p[10].y);
+        } else {
+            float2 local = asciiLocal(position, p);
+            float softness = mode == 1 ? p[23].y : 0.2;
+            float footprint = cell.x * (1.0 - 0.72 * p[22].w);
+            float mask = asciiGlyphMask(atlas, local, glyph, p[10].z, footprint, softness) * asciiCoverage(value.rgb, p);
+            float3 background = c * p[24].x;
+            if (mode == 1) {
+                float3 ink = mix(value.rgb, float3(1.0), 0.55);
+                c = background + (1.0 - background) * ink * saturate(mask * p[23].w * 1.6);
+            } else {
+                float3 ink = asciiGlowInk(glyph, p);
+                float3 emission = ink * mask;
+                if (p[24].w > 0.0) {
+                    uint hash = blockHash(uint2(floor(position)), 0, 154);
+                    float ghost = min(1.0 + float(hash % 3), p[10].w - 1.0);
+                    float ghostInk = asciiGlyphMask(atlas, local, ghost, p[10].z, footprint, 0.2);
+                    emission += p[13].rgb * ghostInk * (1.0 - mask) * (0.35 * p[24].w);
+                }
+                if (p[24].z > 0.0) emission += halo.sample(linearSampler, uv).rgb * (2.6 * p[24].z);
+                c = mix(c, background + (1.0 - background) * saturate(emission), p[10].y);
+            }
+        }
     }
-    target.write(float4(clamp(c, 0.0, 1.0), 1), gid);
+    target.write(float4(saturate(c), 1), gid);
 }
 
 constant float dctBasis[64] = {0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f, 0.353553391f, 0.490392640f, 0.415734806f, 0.277785117f, 0.097545161f, -0.097545161f, -0.277785117f, -0.415734806f, -0.490392640f, 0.461939766f, 0.191341716f, -0.191341716f, -0.461939766f, -0.461939766f, -0.191341716f, 0.191341716f, 0.461939766f, 0.415734806f, -0.097545161f, -0.490392640f, -0.277785117f, 0.277785117f, 0.490392640f, 0.097545161f, -0.415734806f, 0.353553391f, -0.353553391f, -0.353553391f, 0.353553391f, 0.353553391f, -0.353553391f, -0.353553391f, 0.353553391f, 0.277785117f, -0.490392640f, 0.097545161f, 0.415734806f, -0.415734806f, -0.097545161f, 0.490392640f, -0.277785117f, 0.191341716f, -0.461939766f, 0.461939766f, -0.191341716f, -0.191341716f, 0.461939766f, -0.461939766f, 0.191341716f, 0.097545161f, -0.277785117f, 0.415734806f, -0.490392640f, 0.490392640f, -0.415734806f, 0.277785117f, -0.097545161f};

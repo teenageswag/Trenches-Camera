@@ -60,7 +60,7 @@ TRENCHES_VERIFY=1 bash Trenches/scripts/build.sh --sign -c debug
 bash Trenches/scripts/install.sh
 ```
 
-Открой trenches вручную. Режим проверит Metal, десять live-эффектов, статичный и движущийся Motion Blur, семь режимов Datamosh, сбросы и скраббинг, смешанный экспорт с точным копированием AAC, JPEG/MOV и запись движущегося ASCII 1080p/30 со синтетическим звуком. После COMPLETE или FAIL:
+Открой trenches вручную. Диагностика проверяет Metal, выдержку камеры, Dither, наборы и слои ASCII, Datamosh и JPEG/MOV. Тестовая запись со звуком включает прогоны 1080p/30, 1080p/60 и 4K/30. После COMPLETE или FAIL выполни команду.
 
 ```bash
 python3 Trenches/scripts/read-verification.py
@@ -88,6 +88,7 @@ python3 Trenches/scripts/read-verification.py --datamosh
 | --- | --- |
 | `CameraService.swift` | Сессия камеры, глубина, очередь кадров и запись |
 | `FrameRenderer.swift`, `Shaders/Effects.metal` | Core Image и Metal-эффекты |
+| `ASCIIAtlas.swift` | CoreText и растеризация символов в атлас с mip-уровнями |
 | `CameraPreview.swift` | Отображение готовых кадров через Metal |
 | `MovieRecorder.swift` | HEVC / H.264 + AAC, временная шкала и завершение MOV |
 | `CameraModel.swift`, `ContentView.swift`, `EffectPanels.swift` | Состояние и SwiftUI-интерфейс |

@@ -45,6 +45,9 @@ struct EffectEditor: View {
     @Environment(\.dismiss) private var dismiss
 
     private var toggleLocked: Bool { model.controlsLocked && effect == .dof && model.settings.value(.dof, "mode") >= 0.5 }
+    private var parameters: [EffectParameter] {
+        effect == .ascii ? model.settings.asciiMode.editableParameters : effect.parameters
+    }
     var body: some View {
         NavigationStack {
             Form {
@@ -54,7 +57,7 @@ struct EffectEditor: View {
                     }.disabled(toggleLocked)
                 } footer: { Text(effect.subtitle) }
                 Section {
-                    ForEach(effect.parameters.filter(visible)) { parameter in
+                    ForEach(parameters.filter(visible)) { parameter in
                         parameterControl(parameter)
                     }
                     if effect == .motion, model.status.running {
@@ -69,15 +72,22 @@ struct EffectEditor: View {
                         }
                     }
                 }
-                if effect == .ascii {
+                if effect == .ascii, model.settings.asciiMode != .blur {
                     Section("Цвета ASCII") {
-                        if model.settings.value(.ascii, "palette") >= 4 {
-                            ColorPicker("Цвет символов", selection: effectColor("ink"), supportsOpacity: false)
+                        if model.settings.asciiMode == .glow {
+                            ColorPicker("Цвет символов", selection: effectColor("glowInk"), supportsOpacity: false)
+                            if model.settings.value(.ascii, "glowPalette") >= 0.5 {
+                                ColorPicker("Второй цвет символов", selection: effectColor("glowInk2"), supportsOpacity: false)
+                            }
+                        } else {
+                            if model.settings.value(.ascii, "palette") >= 4 {
+                                ColorPicker("Цвет символов", selection: effectColor("ink"), supportsOpacity: false)
+                            }
+                            if model.settings.value(.ascii, "palette") >= 5 {
+                                ColorPicker("Второй цвет символов", selection: effectColor("ink2"), supportsOpacity: false)
+                            }
+                            ColorPicker("Цвет фона", selection: effectColor("paper"), supportsOpacity: false)
                         }
-                        if model.settings.value(.ascii, "palette") >= 5 {
-                            ColorPicker("Второй цвет символов", selection: effectColor("ink2"), supportsOpacity: false)
-                        }
-                        ColorPicker("Цвет фона", selection: effectColor("paper"), supportsOpacity: false)
                     }
                 }
                 if effect == .dither, model.settings.value(.dither, "palette") == Float(DitherPalette.duotone.rawValue) {
@@ -127,22 +137,36 @@ struct EffectEditor: View {
         Binding(get: { model.settings.value(effect, parameter.id) }, set: { model.settings.set(effect, parameter.id, $0) })
     }
     @ViewBuilder private func parameterControl(_ parameter: EffectParameter) -> some View {
-        if !parameter.choices.isEmpty {
+        let title = effect == .dither && parameter.id == "levels" && model.settings.value(.dither, "palette") == Float(DitherPalette.source.rawValue)
+            ? "Уровни на канал" : parameter.title
+        if effect == .ascii, parameter.id == "symbols" {
+            Picker(parameter.title, selection: binding(parameter)) {
+                ForEach(ASCIISymbols.displayOrder, id: \.rawValue) { set in Text(set.title).tag(Float(set.rawValue)) }
+            }
+        } else if effect == .ascii, parameter.id == "characterOn" {
+            let selection = Binding<Float>(get: {
+                model.settings.asciiUsesLegacyPlacement ? -1 : model.settings.value(.ascii, parameter.id)
+            }, set: { model.settings.set(.ascii, parameter.id, $0) })
+            Picker(parameter.title, selection: selection) {
+                if model.settings.asciiUsesLegacyPlacement { Text("Как в старом пресете").tag(Float(-1)) }
+                ForEach(ASCIIPlacement.allCases, id: \.rawValue) { placement in Text(placement.title).tag(Float(placement.rawValue)) }
+            }
+        } else if !parameter.choices.isEmpty {
             Picker(parameter.title, selection: binding(parameter)) {
                 ForEach(Array(parameter.choices.enumerated()), id: \.offset) { index, title in Text(title).tag(Float(index)) }
             }.disabled(effect == .dof && parameter.id == "mode" && model.controlsLocked)
         } else {
             VStack(spacing: 10) {
                 HStack {
-                    Text(parameter.title).font(.system(.subheadline, design: .monospaced))
+                    Text(title).font(.system(.subheadline, design: .monospaced))
                     Spacer()
                     Text(parameter.formatted(model.settings.value(effect, parameter.id))).font(.system(.subheadline, design: .monospaced)).foregroundStyle(TrenchesTheme.accent).monospacedDigit()
                 }
                 Group {
                     if let step = parameter.step {
-                        Slider(value: binding(parameter), in: parameter.range, step: step) { Text(parameter.title) }
+                        Slider(value: binding(parameter), in: parameter.range, step: step) { Text(title) }
                     } else {
-                        Slider(value: binding(parameter), in: parameter.range) { Text(parameter.title) }
+                        Slider(value: binding(parameter), in: parameter.range) { Text(title) }
                     }
                 }.accessibilityValue(parameter.formatted(model.settings.value(effect, parameter.id)))
             }.padding(.vertical, 7)

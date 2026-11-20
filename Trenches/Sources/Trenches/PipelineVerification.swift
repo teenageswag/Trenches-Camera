@@ -29,7 +29,12 @@ enum PipelineVerification {
                 record("PASS effect \(effect.rawValue)")
             }
             try verifyDither(renderer: renderer, image: image, baseline: baselineBytes, record: record)
+            try verifyFloydSteinberg(renderer: renderer, record: record)
+            try verifyFloydSteinberg(renderer: FrameRenderer(allowSIMDDiffusion: false)) { _ in
+                record("PASS Apple5 threadgroup fallback / same Floyd–Steinberg stencil")
+            }
             try verifyASCIIShadows(renderer: renderer, record: record)
+            try await verifyASCIIModes(renderer: renderer, image: image, baseline: baselineBytes, record: record)
             try verifyCameraShutter(record: record)
             record(try await CameraService.verifyShutterHardware())
             try await verifyDatamosh(renderer: renderer, record: record)
@@ -78,6 +83,21 @@ enum PipelineVerification {
                 record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: dither, paced: false).run())
                 record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: dither, paced: true).run())
             }
+            for mode in [ASCIIMode.blur, .glow] {
+                var settings = EffectSettings()
+                settings.toggle(.ascii)
+                settings.set(.ascii, "mode", Float(mode.rawValue))
+                record("BENCH \(mode.title) / defaults / 1080×1920")
+                record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: settings, paced: true).run())
+            }
+            var combined = dither
+            combined.toggle(.ascii)
+            combined.set(.ascii, "mode", Float(ASCIIMode.glow.rawValue))
+            record("BENCH Dither JJN + ASCII Glow / 1080×1920")
+            record(try await RenderBenchmark(renderer: renderer, image: benchmarkImage, settings: combined, paced: true, fps: 60, seconds: 4).run())
+            let uhd = benchmarkImage.transformed(by: CGAffineTransform(scaleX: 2, y: 2))
+            record("BENCH Dither JJN + ASCII Glow / 2160×3840")
+            record(try await RenderBenchmark(renderer: renderer, image: uhd, settings: combined, paced: true, seconds: 4).run())
             record("COMPLETE")
         } catch { record("FAIL \(error.localizedDescription)") }
         let report = lines.joined(separator: "\n")
@@ -113,6 +133,43 @@ enum PipelineVerification {
         record("PASS Dither 11 unique modes / deterministic mask / duotone / mix at zero")
     }
 
+    private static func verifyFloydSteinberg(renderer: FrameRenderer, record: (String) -> Void) throws {
+        let width = 24, height = 12
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        for i in 0..<(width * height) {
+            let gray = UInt8(32 + (i * 79 + i / width * 23 + i / 7 * 29) % 192)
+            pixels[i * 4] = gray
+            pixels[i * 4 + 1] = gray
+            pixels[i * 4 + 2] = gray
+        }
+        let image = CIImage(bitmapData: Data(pixels), bytesPerRow: width * 4, size: CGSize(width: width, height: height),
+                            format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        let baseline = bytes(try renderer.render(image, depth: nil, settings: EffectSettings(), time: 0))
+        var settings = EffectSettings()
+        settings.toggle(.dither)
+        settings.set(.dither, "mode", Float(DitherMode.floydSteinberg.rawValue))
+        settings.set(.dither, "pixel", 1)
+        let rendered = bytes(try renderer.render(image, depth: nil, settings: settings, time: 0))
+        var errors = [Float](repeating: 0, count: width * (height + 1))
+        for y in 0..<height {
+            for x in 0..<width {
+                let i = y * width + x
+                let input = Float(Float16(Float(baseline[i * 4]) / 255))
+                let signal = min(1, max(0, input + errors[i] / 16))
+                let threshold: UInt8 = signal >= 0.5 ? 255 : 0
+                guard rendered[i * 4] == threshold else {
+                    throw TrenchesError.message("Floyd–Steinberg расходится с последовательным стэнсилом в \(x),\(y)")
+                }
+                let error = signal - Float(threshold) / 255
+                if x + 1 < width { errors[i + 1] += 7 * error }
+                if x > 0 { errors[i + width - 1] += 3 * error }
+                errors[i + width] += 5 * error
+                if x + 1 < width { errors[i + width + 1] += error }
+            }
+        }
+        record("PASS Floyd–Steinberg / GPU wavefront matches raster reference in a single tile")
+    }
+
     private static func verifyASCIIShadows(renderer: FrameRenderer, record: (String) -> Void) throws {
         let width = 1080, height = 90, bandWidth = 216
         let levels: [UInt8] = [0, 9, 28, 62, 235]
@@ -124,8 +181,7 @@ enum PipelineVerification {
         let image = CIImage(bitmapData: Data(pixels), bytesPerRow: width * 4, size: CGSize(width: width, height: height),
                             format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
         var settings = EffectSettings()
-        settings.toggle(.ascii)
-        settings.set(.ascii, "cell", 6); settings.set(.ascii, "contrast", 3); settings.set(.ascii, "palette", 4)
+        settings.effects[.ascii] = EffectState(enabled: true, values: ["cell": 6, "contrast": 3, "palette": 4])
         let output = bytes(try renderer.render(image, depth: nil, settings: settings, time: 1))
         let ink = levels.indices.map { band in
             (0..<height).reduce(0) { total, y in
@@ -139,6 +195,64 @@ enum PipelineVerification {
             throw TrenchesError.message("ASCII 6 px/300% теряет детали в тенях: \(ink)")
         }
         record("PASS ASCII 6 px/300% / black background and shadow glyphs: \(ink)")
+    }
+
+    private static func verifyASCIIModes(renderer: FrameRenderer, image: CIImage, baseline: [UInt8],
+                                         record: (String) -> Void) async throws {
+        var settings = EffectSettings()
+        settings.toggle(.ascii)
+        settings.set(.ascii, "mode", Float(ASCIIMode.blur.rawValue))
+        settings.set(.ascii, "blurInk", 0)
+        settings.set(.ascii, "blurPhoto", 1)
+        settings.set(.ascii, "blurBackground", 0)
+        func render(_ settings: EffectSettings) throws -> [UInt8] {
+            bytes(try renderer.render(image, depth: nil, settings: settings, time: 0))
+        }
+        guard try render(settings) == baseline else { throw TrenchesError.message("ASCII Blur меняет исходник при отключённых слоях") }
+        settings.set(.ascii, "blurBackground", 1)
+        guard try render(settings) != baseline else { throw TrenchesError.message("ASCII Blur не применил размытие фона") }
+
+        settings.set(.ascii, "mode", Float(ASCIIMode.glow.rawValue))
+        settings.set(.ascii, "glowPhoto", 0)
+        settings.set(.ascii, "glowGhost", 0)
+        settings.set(.ascii, "glowStrength", 0)
+        var patterns: Set<Data> = []
+        for symbols in ASCIISymbols.allCases {
+            settings.set(.ascii, "symbols", Float(symbols.rawValue))
+            let result = try render(settings)
+            guard stride(from: 1, to: result.count, by: 4).contains(where: { result[$0] > 10 }),
+                  patterns.insert(Data(result)).inserted else {
+                throw TrenchesError.message("ASCII пропустил или повторил набор \(symbols.title)")
+            }
+        }
+        var placements: Set<Data> = []
+        for placement in ASCIIPlacement.allCases {
+            settings.set(.ascii, "characterOn", Float(placement.rawValue))
+            guard try placements.insert(Data(render(settings))).inserted else {
+                throw TrenchesError.message("Область ASCII \(placement.title) не меняет рисунок")
+            }
+        }
+        let symbolsOnly = try render(settings)
+        settings.set(.ascii, "glowStrength", 1)
+        guard try render(settings) != symbolsOnly else { throw TrenchesError.message("ASCII Glow не рисует ореол") }
+        settings.set(.ascii, "glowStrength", 0)
+        settings.set(.ascii, "glowGhost", 1)
+        guard try render(settings) != symbolsOnly else { throw TrenchesError.message("ASCII Glow не рисует фоновую сетку") }
+        settings.set(.ascii, "glowMix", 0)
+        guard try render(settings) == baseline else { throw TrenchesError.message("ASCII Glow меняет исходник при нулевом смешивании") }
+
+        settings.set(.ascii, "glowMix", 1)
+        settings.toggle(.dither)
+        settings.set(.dither, "mode", Float(DitherMode.blueNoise.rawValue))
+        let snapshot = settings
+        let expected = try render(snapshot)
+        let asyncFrame: CVPixelBuffer = try await withCheckedThrowingContinuation { continuation in
+            do {
+                try renderer.renderAsync(image, depth: nil, settings: snapshot, time: 0) { continuation.resume(with: $0) }
+            } catch { continuation.resume(throwing: error) }
+        }
+        guard bytes(asyncFrame) == expected else { throw TrenchesError.message("Фото и live-кадр дают разные пиксели") }
+        record("PASS ASCII 11 packs / 3 placements / independent blur, halo and ghost grid / still and live render parity")
     }
 
     private static func verifyCameraShutter(record: (String) -> Void) throws {
@@ -317,8 +431,10 @@ private final class RenderBenchmark: @unchecked Sendable {
     private let image: CIImage
     private let settings: EffectSettings
     private let paced: Bool
+    private let fps: Int32
+    private let seconds: Int
     private let queue = DispatchQueue(label: "dev.trenches.benchmark", qos: .userInitiated)
-    private var total: Int { paced ? 240 : 90 }
+    private var total: Int { paced ? seconds * Int(fps) : 90 }
     private var scheduled = 0
     private var pending = 0
     private var completed = 0
@@ -331,8 +447,9 @@ private final class RenderBenchmark: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var continuation: CheckedContinuation<String, Error>?
 
-    init(renderer: FrameRenderer, image: CIImage, settings: EffectSettings, paced: Bool) {
+    init(renderer: FrameRenderer, image: CIImage, settings: EffectSettings, paced: Bool, fps: Int32 = 30, seconds: Int = 8) {
         self.renderer = renderer; self.image = image; self.settings = settings; self.paced = paced
+        self.fps = fps; self.seconds = seconds
     }
 
     func run() async throws -> String {
@@ -341,10 +458,10 @@ private final class RenderBenchmark: @unchecked Sendable {
                 self.continuation = continuation
                 started = CACurrentMediaTime()
                 if paced {
-                    do { recorder = try MovieRecorder(width: 1080, height: 1920, fps: 30, includeAudio: true) }
+                    do { recorder = try MovieRecorder(width: Int(image.extent.width), height: Int(image.extent.height), fps: fps, includeAudio: true) }
                     catch { continuation.resume(throwing: error); return }
                     let timer = DispatchSource.makeTimerSource(queue: queue)
-                    timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / 30), leeway: .milliseconds(1))
+                    timer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / Int(fps)), leeway: .milliseconds(1))
                     timer.setEventHandler { [self] in tick() }
                     self.timer = timer
                     timer.resume()
@@ -373,7 +490,7 @@ private final class RenderBenchmark: @unchecked Sendable {
                 self.durations.append((CACurrentMediaTime() - start) * 1000)
                 do {
                     let buffer = try result.get()
-                    try self.recorder?.appendVideo(buffer, at: CMTime(value: Int64(index), timescale: 30))
+                    try self.recorder?.appendVideo(buffer, at: CMTime(value: Int64(index), timescale: self.fps))
                     self.completed += 1
                 } catch { self.firstError = error }
                 if self.paced { self.finishIfReady() } else { self.pump() }
@@ -381,17 +498,17 @@ private final class RenderBenchmark: @unchecked Sendable {
         }
         do {
             let movingImage = paced ? image.clampedToExtent().transformed(by: CGAffineTransform(translationX: sin(Double(index) * 0.47) * 90, y: cos(Double(index) * 0.31) * 140)).cropped(to: image.extent) : image
-            try renderer.renderAsync(movingImage, depth: nil, settings: settings, time: Double(index) / 30, completion: complete)
+            try renderer.renderAsync(movingImage, depth: nil, settings: settings, time: Double(index) / Double(fps), completion: complete)
             if paced {
-                do { try recorder?.appendAudio(Self.audio(at: index)) }
+                do { try recorder?.appendAudio(Self.audio(at: index, fps: fps)) }
                 catch { firstError = error }
             }
         }
         catch { complete(.failure(error)) }
     }
 
-    static func audio(at frame: Int) throws -> CMSampleBuffer {
-        let count = 1600
+    static func audio(at frame: Int, fps: Int32 = 30) throws -> CMSampleBuffer {
+        let count = 48_000 / Int(fps)
         var description = AudioStreamBasicDescription(mSampleRate: 48000, mFormatID: kAudioFormatLinearPCM, mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1, mBitsPerChannel: 32, mReserved: 0)
         var format: CMAudioFormatDescription?
         guard CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &description, layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format) == noErr, let format else { throw TrenchesError.message("Benchmark audio format") }
@@ -399,7 +516,7 @@ private final class RenderBenchmark: @unchecked Sendable {
         guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: count * 4, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: count * 4, flags: 0, blockBufferOut: &block) == noErr, let block else { throw TrenchesError.message("Benchmark audio allocation") }
         let samples = (0..<count).map { Float(sin(Double(frame * count + $0) * 2 * .pi * 440 / 48000) * 0.02) }
         let copied = samples.withUnsafeBytes { CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: $0.count) }
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48000), presentationTimeStamp: CMTime(value: Int64(frame), timescale: 30), decodeTimeStamp: .invalid)
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48000), presentationTimeStamp: CMTime(value: Int64(frame), timescale: fps), decodeTimeStamp: .invalid)
         var sampleSize = 4
         var sample: CMSampleBuffer?
         guard copied == noErr, CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format, sampleCount: count, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sample) == noErr, let sample else { throw TrenchesError.message("Benchmark audio buffer") }
@@ -413,7 +530,7 @@ private final class RenderBenchmark: @unchecked Sendable {
         let elapsed = CACurrentMediaTime() - started
         let ordered = durations.sorted()
         let p95 = ordered.isEmpty ? 0 : ordered[min(ordered.count - 1, Int(Double(ordered.count) * 0.95))]
-        let summary = String(format: "%@: %.1f render FPS, p95 %.1f ms, %d skipped", paced ? "MOVING + AUDIO 30" : "THROUGHPUT", Double(completed) / elapsed, p95, skipped)
+        let summary = String(format: "%@: %.1f render FPS, p95 %.1f ms, %d skipped", paced ? "MOVING + AUDIO \(fps)" : "THROUGHPUT", Double(completed) / elapsed, p95, skipped)
         guard let recorder else { continuation.resume(returning: summary); return }
         let frames = recorder.frameCount
         recorder.finish { result in

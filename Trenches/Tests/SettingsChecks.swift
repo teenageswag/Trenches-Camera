@@ -27,6 +27,37 @@ struct SettingsChecks {
         precondition(LookPreset.builtIns.count == 3)
         for preset in LookPreset.builtIns { precondition(preset.settings.activeCount > 0) }
         precondition(CaptureQuality.uhd30.width == 3840 && CaptureQuality.hd60.fps == 60)
+        var letterModes = EffectSettings()
+        letterModes.toggle(.ascii)
+        precondition(letterModes.asciiMode == .ascii && !letterModes.asciiUsesLegacyPlacement)
+        precondition(letterModes.value(.ascii, "characterOn") == Float(ASCIIPlacement.darkest.rawValue))
+        let blurDefaults: [String: Float] = ["blurCell": 6, "blurCoverage": 1, "blurSoftness": 1, "blurGap": 0.2,
+            "blurExposure": 1, "blurScatter": 0, "blurInk": 1, "blurPhoto": 0.7, "blurBackground": 0.2]
+        let glowDefaults: [String: Float] = ["glowCell": 16, "glowContrast": 0, "glowGap": 0.2, "glowExposure": 1.2,
+            "glowStrength": 0.6, "glowGhost": 0.5, "glowPhoto": 0.7, "glowMix": 1]
+        for (key, value) in blurDefaults.merging(glowDefaults, uniquingKeysWith: { first, _ in first }) {
+            precondition(letterModes.value(.ascii, key) == value)
+        }
+        letterModes.set(.ascii, "mode", Float(ASCIIMode.blur.rawValue))
+        letterModes.set(.ascii, "blurCell", 8)
+        letterModes.set(.ascii, "mode", Float(ASCIIMode.glow.rawValue))
+        letterModes.set(.ascii, "symbols", Float(ASCIISymbols.braille.rawValue))
+        letterModes.set(.dither, "mode", Float(DitherMode.jarvisJudiceNinke.rawValue))
+        let presetRoundTrip = try JSONDecoder().decode(LookPreset.self, from: JSONEncoder().encode(LookPreset(name: "Modes", settings: letterModes)))
+        precondition(presetRoundTrip.settings == letterModes && presetRoundTrip.settings.asciiMode == .glow)
+        precondition(presetRoundTrip.settings.value(.ascii, "blurCell") == 8)
+        var legacyASCII = EffectSettings()
+        legacyASCII.effects[.ascii] = EffectState(enabled: true, values: ["symbols": 1, "cell": 6])
+        let decodedLegacy = try JSONDecoder().decode(EffectSettings.self, from: JSONEncoder().encode(legacyASCII))
+        precondition(decodedLegacy == legacyASCII && decodedLegacy.asciiUsesLegacyPlacement && decodedLegacy.asciiUsesLegacyGlyphs)
+        legacyASCII.set(.ascii, "symbols", Float(ASCIISymbols.digits.rawValue))
+        precondition(legacyASCII.asciiUsesLegacyPlacement && !legacyASCII.asciiUsesLegacyGlyphs)
+        precondition(ASCIISymbols(rawValue: 0) == .standard && ASCIISymbols(rawValue: 1) == .classic)
+        precondition(ASCIISymbols(rawValue: 2) == .blocks && ASCIISymbols(rawValue: 3) == .binary)
+        precondition(Set(ASCIISymbols.displayOrder).count == 11)
+        legacyASCII.reset(.ascii)
+        precondition(legacyASCII.enabled(.ascii) && !legacyASCII.asciiUsesLegacyPlacement)
+        print("PASS: three ASCII modes, legacy presets, independent controls, glyph IDs, Dither and ASCII preset round trip")
         print("PASS: defaults, parameter bounds, NaN recovery, effect stacking, depth mode, JSON persistence, presets, capture profiles")
         var document = DatamoshDocument()
         let first = DatamoshSegment(start: 10, duration: 20)

@@ -90,7 +90,7 @@ final class CameraModel: ObservableObject {
     }
     func reset(_ effect: EffectID) {
         guard !(controlsLocked && effect == .dof) else { return }
-        settings.effects[effect] = EffectState(enabled: settings.enabled(effect))
+        settings.reset(effect)
     }
     func apply(_ preset: LookPreset) { guard !controlsLocked else { return }; settings = preset.settings }
     func addPreset(_ name: String) {
